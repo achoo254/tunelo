@@ -1,8 +1,8 @@
 # Phase 3: Customer API + Org Limits Enforcement
 
 ## Context Links
-- [Phase 1](./phase-01-mongodb-setup-and-key-store.md) — MongoDB + KeyStore
-- [Phase 2](./phase-02-user-auth-and-admin-api.md) — User auth + Admin API
+- [Phase 1](./phase-01-mongodb-setup-and-key-store.md) — MongoDB + KeyStore + TunnelConnection
+- [Phase 2](./phase-02-express-auth-and-admin-api.md) — Express + Auth + Admin API
 - [tunnel-manager.ts](../../packages/server/src/tunnel-manager.ts)
 - [ws-handler.ts](../../packages/server/src/ws-handler.ts)
 
@@ -10,14 +10,15 @@
 - **Priority:** P1
 - **Status:** Pending
 - **Effort:** 10h
-- **Description:** Customer-facing API for self-service key management. Enforce org-level limits (maxKeys, maxTunnelsPerKey). Customers can create/revoke/list their own keys.
+- **Description:** Customer-facing API for self-service key management. Enforce org-level limits (maxKeys, maxTunnelsPerKey). Revoking a key disconnects active tunnels.
 
 ## Key Insights
+- Phase 1 already added `apiKeyHash` + `orgId` to TunnelConnection + `countByKeyHash()`/`disconnectByKeyHash()` methods
 - Phase 2 provides JWT middleware + api-key-service — reuse here
-- `tunnel-manager.ts` currently doesn't track org association — need to add `orgId` to `TunnelConnection`
-- `maxTunnelsPerKey` enforcement requires counting active tunnels per key hash at auth time
-- Key generation: `tk_` prefix + 32 char random → plaintext returned ONCE, hash stored
-- Current `TunnelConnection.apiKey` stores raw key string — change to keyHash for security
+- `maxTunnelsPerKey` enforcement: check `tunnelManager.countByKeyHash()` during WS auth in ws-handler
+- Key format: `tk_` prefix + 32 char nanoid → plaintext returned ONCE, hash stored
+- Customer routes need JWT auth (from Phase 2 middleware)
+- Accept any key format on validation (no `tk_` prefix enforcement) — new keys generated with `tk_` but old keys without prefix still work
 
 ## Requirements
 
@@ -25,69 +26,47 @@
 - **Customer endpoints (JWT auth):**
   - GET `/api/keys` — list own org's keys (prefix, label, status, created, lastUsed)
   - POST `/api/keys` — create new key (returns plaintext ONCE)
-  - DELETE `/api/keys/:keyId` — revoke key (soft delete: status → "revoked")
+  - DELETE `/api/keys/:keyId` — revoke key (status → "revoked")
   - GET `/api/profile` — own user + org info
   - PATCH `/api/profile/password` — change password
 - **Org limits enforcement:**
   - `maxKeys`: reject key creation if org at limit
-  - `maxTunnelsPerKey`: reject tunnel registration if key at tunnel limit
-  - `org.status`: reject auth if org suspended
-- **Key format:** `tk_{32_random_alphanumeric}` (total 35 chars)
+  - `maxTunnelsPerKey`: reject WS tunnel auth if key at tunnel limit
+  - `org.status`: reject auth if org suspended (already in Phase 1 MongoKeyStore)
+- **Key revocation side effect:** disconnect all active tunnels using that keyHash
 
 ### Non-Functional
 - Key creation returns plaintext exactly once — never retrievable again
-- Revoking a key disconnects all active tunnels using that key
 - Customer can only see/manage keys in their own org
 - Member role can create/revoke keys; owner can do everything
 
 ## Architecture
 
+### Customer API Flow
 ```
-Customer API Flow:
-  JWT → jwtAuthMiddleware → req.user = { userId, orgId, role }
+JWT → jwtAuthMiddleware → req.user = { userId, orgId, role }
 
-  POST /api/keys:
-    → check org.limits.maxKeys > current active key count
-    → generate tk_{random32}
-    → hash → store in api-keys collection
-    → return { key: "tk_xxx", keyId, label, prefix }  ← plaintext ONCE
+POST /api/keys:
+  → orgService.getOrg(orgId) → check limits.maxKeys
+  → apiKeyService.countActiveKeys(orgId)
+  → if count >= maxKeys → 403 "Key limit reached"
+  → apiKeyService.createKey(orgId, userId, label)
+  → return { key: "tk_xxx", keyId, label, prefix }  ← plaintext ONCE
 
-  DELETE /api/keys/:keyId:
-    → verify key belongs to req.user.orgId
-    → set status = "revoked"
-    → disconnect all tunnels using this keyHash
-
-Tunnel Limit Enforcement:
-  ws-handler.ts auth event:
-    → keyStore.validate(hash) → KeyInfo { maxTunnels }
-    → count active tunnels with same keyHash in TunnelManager
-    → if count >= maxTunnels → reject with error
+DELETE /api/keys/:keyId:
+  → verify key belongs to req.user.orgId
+  → apiKeyService.revokeKey(keyId, orgId) → returns keyHash
+  → tunnelManager.disconnectByKeyHash(keyHash)
+  → return { success: true }
 ```
 
-### TunnelConnection Enhancement
-```typescript
-// Add to TunnelConnection interface:
-interface TunnelConnection {
-  socket: Socket;
-  apiKeyHash: string;     // Changed from apiKey (raw) to hash
-  orgId: string;          // NEW: for org-level queries
-  subdomain: string;
-  connectedAt: Date;
-  pendingRequests: Map<string, PendingRequest>;
-  authHash?: string;
-}
+### Tunnel Limit Enforcement (ws-handler.ts update)
 ```
-
-### TunnelManager New Methods
-```typescript
-// Count tunnels by key hash
-countByKeyHash(keyHash: string): number;
-
-// Count tunnels by org
-countByOrg(orgId: string): number;
-
-// Disconnect all tunnels for a key hash (when key revoked)
-disconnectByKeyHash(keyHash: string): void;
+ws-handler.ts handleAuth():
+  → keyStore.validate(keyHash) → KeyInfo { maxTunnels, orgId }
+  → tunnelManager.countByKeyHash(keyHash)
+  → if count >= keyInfo.maxTunnels → reject with TUNELO_TUNNEL_004 error
+  → register tunnel with keyHash + orgId
 ```
 
 ## Related Code Files
@@ -102,54 +81,69 @@ disconnectByKeyHash(keyHash: string): void;
 ### Files to MODIFY
 | File | Change |
 |------|--------|
-| `packages/server/src/tunnel-manager.ts` | Add `orgId`, `apiKeyHash` to TunnelConnection. Add `countByKeyHash()`, `countByOrg()`, `disconnectByKeyHash()` methods |
-| `packages/server/src/ws-handler.ts` | Enforce maxTunnelsPerKey limit during auth. Store keyHash + orgId in tunnel registration |
-| `packages/server/src/api/api-router.ts` | Mount customer routes under `/api` |
-| `packages/server/src/services/api-key-service.ts` | Add `createKey()` with limit check, `listKeysByOrg()` |
+| `packages/server/src/ws-handler.ts` | Add maxTunnelsPerKey check after keyStore.validate() |
+| `packages/server/src/api/create-api-router.ts` | Mount customer routes under `/api/keys` + `/api/profile` |
+| `packages/server/src/services/api-key-service.ts` | Add `countActiveKeys(orgId)`, enhance `createKey()` with limit check |
+| `packages/shared/src/errors.ts` | Add `TUNELO_TUNNEL_004` (tunnel limit reached) error code |
 
 ## Implementation Steps
 
-### Step 1: Enhance TunnelManager
-- Add `apiKeyHash` and `orgId` fields to `TunnelConnection`
-- Update `register()` signature: `register(subdomain, socket, apiKeyHash, orgId, auth?)`
-- Add `countByKeyHash(keyHash): number` — iterate tunnels, count matches
-- Add `countByOrg(orgId): number`
-- Add `disconnectByKeyHash(keyHash): void` — find + disconnect + unregister all
+### Step 1: Add tunnel limit error code
+- In `packages/shared/src/errors.ts`: add `TUNELO_TUNNEL_004` — "Tunnel limit reached for this key"
 
-### Step 2: Update ws-handler.ts for limits
-- After `keyStore.validate()` returns `KeyInfo`:
-  - Count active tunnels: `tunnelManager.countByKeyHash(keyHash)`
-  - If count >= `keyInfo.maxTunnels` → emit error, disconnect
-- Pass `keyHash` + `keyInfo.orgId` to `tunnelManager.register()`
+### Step 2: Enforce maxTunnelsPerKey in ws-handler.ts
+- In `handleAuth()`, after `keyStore.validate()` returns KeyInfo:
+  ```typescript
+  const currentCount = tunnelManager.countByKeyHash(keyInfo.keyHash);
+  if (currentCount >= keyInfo.maxTunnels) {
+    safeSend(ws, {
+      type: "auth-result",
+      success: false,
+      subdomain: requestedSubdomain,
+      url: "",
+      error: "Tunnel limit reached for this key",
+    });
+    ws.close(WS_CLOSE_CODES.AUTH_FAILED, "Tunnel limit reached");
+    return;
+  }
+  ```
+- Same check in `handleRegisterTunnel()` for additional tunnel registration
 
-### Step 3: Create customer routes
-- `customer-routes.ts`:
-  - GET `/keys` — `apiKeyService.listKeysByOrg(req.user.orgId)`
-  - POST `/keys` — validate label, check limit, `apiKeyService.createKey(orgId, userId, label)`
-  - DELETE `/keys/:keyId` — verify ownership, revoke, `tunnelManager.disconnectByKeyHash()`
-  - GET `/profile` — return user + org info (no passwordHash)
-  - PATCH `/profile/password` — bcrypt verify old, hash new, update
-
-### Step 4: Enhance api-key-service
+### Step 3: Enhance api-key-service
+- `countActiveKeys(orgId)`: `ApiKeyModel.countDocuments({ orgId, status: "active" })`
 - `createKey(orgId, userId, label)`:
-  - Check `org.limits.maxKeys` vs active key count
+  - Fetch org limits: `OrganizationModel.findById(orgId).lean()`
+  - Check `limits.maxKeys` vs `countActiveKeys(orgId)`
+  - If at limit → throw TuneloError `TUNELO_AUTH_003` "Key limit reached"
   - Generate: `tk_${nanoid(32)}`
-  - Hash: SHA-256
+  - Hash: SHA-256 of full key
   - Store: `{ orgId, createdBy, keyHash, keyPrefix: key.slice(0, 7), label, status: "active" }`
   - Return: `{ key (plaintext), keyId, prefix, label }`
-- `listKeysByOrg(orgId)`:
-  - Find all keys for org, return prefix + metadata (no hash)
 - `revokeKey(keyId, orgId)`:
-  - Verify key belongs to org
-  - Set status = "revoked"
-  - Return keyHash (for tunnel disconnection)
+  - `ApiKeyModel.findOneAndUpdate({ _id: keyId, orgId }, { status: "revoked" }).lean()`
+  - Verify key belongs to org (orgId match)
+  - Return `keyHash` for tunnel disconnection
+
+### Step 4: Create customer routes
+- `api/customer-routes.ts`: Express router factory, accepts `{ tunnelManager }`
+  - Apply `jwtAuthMiddleware` to all routes
+  - GET `/keys` — `apiKeyService.listKeysByOrg(req.user.orgId)`
+  - POST `/keys` — validate label (Zod), `apiKeyService.createKey(orgId, userId, label)`
+  - DELETE `/keys/:keyId` — `apiKeyService.revokeKey(keyId, orgId)` → `tunnelManager.disconnectByKeyHash(keyHash)`
+  - GET `/profile` — return user + org info (no passwordHash)
+  - PATCH `/profile/password` — Zod validate, bcrypt verify old, hash new, update
 
 ### Step 5: Mount customer routes
-- In `api-router.ts`: mount customer routes with `jwtAuthMiddleware`
+- In `create-api-router.ts`:
+  ```typescript
+  apiRouter.use('/keys', jwtAuthMiddleware, createCustomerKeyRoutes({ tunnelManager }));
+  apiRouter.use('/profile', jwtAuthMiddleware, createCustomerProfileRoutes());
+  ```
 
 ### Step 6: Write tests
-- Customer routes: create key, list keys, revoke, profile
-- Org limits: maxKeys enforcement, maxTunnelsPerKey enforcement
+- Customer routes: create key (success + limit), list keys, revoke + tunnel disconnect, profile
+- Org limits: maxKeys enforcement (create beyond limit → 403)
+- Tunnel limits: maxTunnelsPerKey enforcement (WS auth rejected when at limit)
 - Key revocation: verify tunnels disconnected after revoke
 
 ### Step 7: Run lint + build + test
@@ -159,40 +153,45 @@ pnpm lint:fix && pnpm build && pnpm test
 
 ## Todo List
 
-- [ ] Enhance `TunnelConnection` with `apiKeyHash` + `orgId`
-- [ ] Add `countByKeyHash()`, `countByOrg()`, `disconnectByKeyHash()` to TunnelManager
-- [ ] Update `ws-handler.ts` for maxTunnelsPerKey enforcement
-- [ ] Enhance `api-key-service.ts` with createKey, listKeys, revokeKey
-- [ ] Create `customer-routes.ts`
-- [ ] Mount customer routes in `api-router.ts`
+- [ ] Add TUNELO_TUNNEL_004 error code
+- [ ] Enforce maxTunnelsPerKey in `ws-handler.ts` handleAuth
+- [ ] Enforce maxTunnelsPerKey in `ws-handler.ts` handleRegisterTunnel
+- [ ] Add `countActiveKeys()` to api-key-service
+- [ ] Enhance `createKey()` with maxKeys limit check
+- [ ] Enhance `revokeKey()` to return keyHash
+- [ ] Create `api/customer-routes.ts` (keys + profile)
+- [ ] Mount customer routes in `create-api-router.ts`
 - [ ] Write customer API tests
-- [ ] Write org limits tests
+- [ ] Write org limits + tunnel limits tests
 - [ ] Run lint + build + test
 
 ## Success Criteria
 
 - Customer can create API key → receives plaintext once
-- Customer can list own keys (sees prefix, not full key)
-- Customer can revoke key → active tunnels using it disconnect
-- maxKeys limit enforced → error when org exceeds limit
-- maxTunnelsPerKey enforced → WS auth rejected when key at limit
-- Customer cannot see/manage keys of other orgs
+- Customer can list own keys (sees prefix, not full key or hash)
+- Customer can revoke key → active tunnels using it disconnect immediately
+- maxKeys limit enforced → TuneloError when org exceeds limit
+- maxTunnelsPerKey enforced → WS auth rejected when key at tunnel limit
+- Customer cannot see/manage keys of other orgs (JWT orgId check)
+- Old keys without `tk_` prefix still validate correctly
+- Password change requires old password verification
 - `pnpm build` + `pnpm lint` + `pnpm test` green
 
 ## Risk Assessment
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| TunnelManager changes break existing tests | Medium | Medium | Update all tests referencing `register()` signature |
 | Key revocation race condition | Low | Medium | Disconnect after DB update, accept brief window |
 | countByKeyHash O(n) scan | Low | Low | n = active tunnels (~10k max), iteration fast enough |
+| Customer route conflicts with admin routes | Low | Low | Separate route prefixes (/keys vs /admin) |
 
 ## Security Considerations
 
 - **Org isolation** — JWT `orgId` always checked against resource ownership
 - **Key plaintext** — returned only on creation, never stored/logged
-- **Password change** — requires old password verification
+- **Password change** — requires old password verification (bcrypt compare)
 - **Revocation** — immediate tunnel disconnection prevents stale access
+- **No hash in response** — list keys returns prefix + metadata only
 
 ## Next Steps
 - Phase 4 depends on: all API endpoints working + limits enforced

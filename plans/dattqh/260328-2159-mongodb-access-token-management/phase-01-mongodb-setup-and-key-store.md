@@ -1,25 +1,25 @@
-# Phase 1: MongoDB Setup + KeyStore Abstraction
+# Phase 1: MongoDB Setup + KeyStore + TunnelConnection Enhancement
 
 ## Context Links
-- [Brainstorm report](../reports/brainstorm-260328-2159-mongodb-access-token-management.md)
+- [Brainstorm review](../reports/brainstorm-260328-2359-mongodb-plan-review.md)
 - [Current auth.ts](../../packages/server/src/auth.ts)
-- [Current server.ts](../../packages/server/src/server.ts)
-- [System architecture](../../docs/system-architecture.md)
+- [Current tunnel-manager.ts](../../packages/server/src/tunnel-manager.ts)
+- [Current ws-handler.ts](../../packages/server/src/ws-handler.ts)
 - [Code standards](../../docs/code-standards.md)
 
 ## Overview
 - **Priority:** P1 (Critical — foundation for all other phases)
 - **Status:** Pending
 - **Effort:** 8h
-- **Description:** Add MongoDB connection, define schemas, create KeyStore abstraction layer, migrate `auth.ts` from JSON file to MongoDB. Keep JSON file mode for dev/fallback.
+- **Description:** Add MongoDB connection, define Mongoose schemas, create KeyStore abstraction layer, enhance TunnelConnection with orgId + apiKeyHash. Keep JSON file mode for dev/fallback.
 
 ## Key Insights
-- Current `auth.ts` loads `keys.json` at startup, hashes keys with SHA-256, stores in `Set<string>`
-- `validateApiKey()` does `Set.has(hash)` — O(1) but no metadata
-- `ws-handler.ts` calls `validateApiKey(msg.key)` on each WS `auth` event
+- Current `auth.ts`: loads `keys.json` → SHA-256 hash → `Set<string>` → `validateApiKey()` returns boolean
+- `ws-handler.ts` line 173: `validateApiKey(msg.key)` — synchronous boolean check
+- `tunnelManager.register(subdomain, socket, connectionId, apiKey, auth?)` — `apiKey` is raw string
+- `TunnelConnection.apiKey` stores raw key — security risk, change to hash
 - Auth happens ONCE per WS connection → ~3ms MongoDB query latency acceptable
-- `tunnel-manager.ts` stores `apiKey` string per tunnel but doesn't use it for validation
-- Server uses `watchFile` for hot-reload — need equivalent MongoDB polling or skip for Phase 1
+- **Phase 1 adds orgId + apiKeyHash to TunnelConnection** — avoids double-refactor in Phase 3
 
 ## Requirements
 
@@ -30,8 +30,10 @@
 - `MongoKeyStore` implementation (production)
 - `JsonFileKeyStore` implementation (dev/fallback, wraps current logic)
 - `validateApiKey` replaced by `keyStore.validate()` returning `KeyInfo | null`
-- Migration script: import `keys.json` → MongoDB
+- `TunnelConnection` enhanced with `apiKeyHash: string` and `orgId: string`
+- `tunnelManager.register()` updated to accept `apiKeyHash` + `orgId`
 - Env-based switching: `MONGO_URI` set → Mongo, else → JSON file
+- Migration script: import `keys.json` → MongoDB
 
 ### Non-Functional
 - Auth latency <10ms per WS connection
@@ -47,7 +49,7 @@ server.ts
   │     ↓
   ├── keyStore.validate(hash) → KeyInfo | null
   │     ↓ (MongoKeyStore)
-  │     MongoDB.apiKeys.findOne({ keyHash, status: "active" })
+  │     MongoDB.apiKeys.findOne({ keyHash, status: "active" }).lean()
   │       → check expiresAt
   │       → join org.status === "active"
   │       → return KeyInfo { orgId, orgSlug, keyId, maxTunnels, plan }
@@ -58,7 +60,7 @@ server.ts
   └── ws-handler.ts
         auth event → keyStore.validate(hashKey(msg.key))
                    → if null: reject
-                   → else: register tunnel with KeyInfo
+                   → else: tunnelManager.register(subdomain, ws, connId, keyHash, orgId, auth)
 ```
 
 ### MongoDB Schema (Mongoose)
@@ -86,7 +88,6 @@ server.ts
   email: { type: String, required: true, unique: true },
   passwordHash: { type: String, required: true },
   role: { type: String, enum: ["owner", "member"], default: "member" },
-  emailVerified: { type: Boolean, default: false },
   status: { type: String, enum: ["active", "suspended"], default: "active" },
   createdAt: Date,
 }
@@ -112,6 +113,7 @@ export interface KeyInfo {
   orgId: string;
   orgSlug: string;
   keyId: string;
+  keyHash: string;
   maxTunnels: number;
   plan: string;
 }
@@ -121,6 +123,33 @@ export interface KeyStore {
   recordUsage(keyHash: string): Promise<void>;
   initialize(): Promise<void>;
   shutdown(): Promise<void>;
+}
+```
+
+### TunnelConnection Enhancement
+
+```typescript
+// BEFORE (current):
+export interface TunnelConnection {
+  socket: WebSocket;
+  connectionId: string;
+  apiKey: string;        // ← raw key string (security risk)
+  subdomain: string;
+  connectedAt: Date;
+  pendingRequests: Map<string, PendingRequest>;
+  authHash?: string;
+}
+
+// AFTER (Phase 1):
+export interface TunnelConnection {
+  socket: WebSocket;
+  connectionId: string;
+  apiKeyHash: string;    // ← SHA-256 hash (secure)
+  orgId: string;         // ← NEW: for org-level queries
+  subdomain: string;
+  connectedAt: Date;
+  pendingRequests: Map<string, PendingRequest>;
+  authHash?: string;
 }
 ```
 
@@ -144,11 +173,10 @@ export interface KeyStore {
 ### Files to MODIFY
 | File | Change |
 |------|--------|
-| `packages/server/src/server.ts` | Replace `loadApiKeys`/`watchApiKeys` with `createKeyStore()` init |
-| `packages/server/src/ws-handler.ts` | Replace `validateApiKey(key)` with `keyStore.validate(hashKey(key))` |
-| `packages/server/src/auth.ts` | Deprecate or remove — logic moves to key-store modules |
-| `packages/server/package.json` | Add `mongoose`, `@types/mongoose` dependencies |
-| `packages/shared/src/protocol.ts` | Add `KeyInfo` to AuthResult (optional, for client display) |
+| `packages/server/src/server.ts` | Replace `loadApiKeys`/`watchApiKeys` with `createKeyStore()` init + shutdown |
+| `packages/server/src/ws-handler.ts` | Replace `validateApiKey(key)` → `keyStore.validate(hashKey(key))`, pass keyHash+orgId to register |
+| `packages/server/src/tunnel-manager.ts` | Change `apiKey: string` → `apiKeyHash: string` + add `orgId: string` in TunnelConnection, update `register()` signature |
+| `packages/server/package.json` | Add `mongoose` dependency |
 
 ### Files to DELETE
 | File | Reason |
@@ -159,42 +187,52 @@ export interface KeyStore {
 
 ### Step 1: Install dependencies
 ```bash
-cd packages/server
-pnpm add mongoose
+cd packages/server && pnpm add mongoose
 ```
 
 ### Step 2: Create MongoDB connection manager
-- `mongo-connection.ts`: connect with `MONGO_URI`, handle errors, expose health check
-- Use Mongoose connection events for logging
+- `db/mongo-connection.ts`: connect with `MONGO_URI`, handle errors, expose health check
+- Use Mongoose connection events for logging (pino)
 - Graceful disconnect on server shutdown
+- Export `connectMongo()`, `disconnectMongo()`, `isMongoConnected()`
 
 ### Step 3: Create Mongoose models
-- `organization-model.ts`: Organization schema with slug unique index
-- `user-model.ts`: User schema with email unique index
-- `api-key-model.ts`: ApiKey schema with keyHash unique index + TTL on expiresAt
+- `db/models/organization-model.ts`: Organization schema with slug unique index
+- `db/models/user-model.ts`: User schema with email unique index, NO `emailVerified` field
+- `db/models/api-key-model.ts`: ApiKey schema with keyHash unique index + TTL on expiresAt
 
 ### Step 4: Create KeyStore interface
-- `key-store-interface.ts`: `KeyStore` interface + `KeyInfo` type
-- Export from a barrel-free path
+- `key-store/key-store-interface.ts`: `KeyStore` interface + `KeyInfo` type
+- Export types directly (no barrel file)
 
 ### Step 5: Implement MongoKeyStore
-- `mongo-key-store.ts`:
-  - `validate(keyHash)`: `ApiKey.findOne({ keyHash, status: "active" })` → join Org → check org.status → check expiresAt → return KeyInfo
+- `key-store/mongo-key-store.ts`:
+  - `validate(keyHash)`: `ApiKey.findOne({ keyHash, status: "active" }).lean()` → lookup org → check org.status → check expiresAt → return KeyInfo
   - `recordUsage(keyHash)`: `ApiKey.updateOne({ keyHash }, { $set: { lastUsedAt: new Date() } })` — fire-and-forget
-  - `initialize()`: verify MongoDB connection
-  - `shutdown()`: disconnect
+  - `initialize()`: verify MongoDB connection alive
+  - `shutdown()`: call `disconnectMongo()`
 
 ### Step 6: Implement JsonFileKeyStore
-- `json-file-key-store.ts`: Wrap current `auth.ts` logic
-  - `validate(keyHash)`: `Set.has(keyHash)` → return fixed KeyInfo `{ orgId: "local", orgSlug: "local", ... }`
+- `key-store/json-file-key-store.ts`: wrap current `auth.ts` logic
+  - `validate(keyHash)`: `Set.has(keyHash)` → return fixed KeyInfo `{ orgId: "local", orgSlug: "local", keyHash, keyId: "local", maxTunnels: 10, plan: "free" }`
   - `recordUsage()`: no-op
-  - `initialize()`: load + watch file
-  - `shutdown()`: unwatch
+  - `initialize()`: load + watchFile (current logic from auth.ts)
+  - `shutdown()`: unwatchFile
 
 ### Step 7: Create KeyStore factory
-- `create-key-store.ts`: if `MONGO_URI` → `MongoKeyStore`, else → `JsonFileKeyStore`
+- `key-store/create-key-store.ts`: if `MONGO_URI` env set → `MongoKeyStore`, else → `JsonFileKeyStore`
+- Log which store is being used
 
-### Step 8: Update server.ts
+### Step 8: Enhance TunnelConnection + TunnelManager
+- In `tunnel-manager.ts`:
+  - Change `apiKey: string` → `apiKeyHash: string` in TunnelConnection interface
+  - Add `orgId: string` to TunnelConnection interface
+  - Update `register()` signature: `register(subdomain, socket, connectionId, apiKeyHash, orgId, auth?)`
+  - Add `countByKeyHash(keyHash: string): number` — iterate tunnels, count matches
+  - Add `countByOrg(orgId: string): number`
+  - Add `disconnectByKeyHash(keyHash: string): void` — find + close + unregister all
+
+### Step 9: Update server.ts
 - Replace `loadApiKeys(keysFile)` + `watchApiKeys(keysFile)` with:
   ```typescript
   const keyStore = createKeyStore();
@@ -203,30 +241,32 @@ pnpm add mongoose
 - Pass `keyStore` to `attachWsHandler(server, keyStore)`
 - Call `keyStore.shutdown()` in graceful shutdown
 
-### Step 9: Update ws-handler.ts
-- Accept `keyStore: KeyStore` parameter
-- Replace `validateApiKey(msg.key)` with:
+### Step 10: Update ws-handler.ts
+- Accept `keyStore: KeyStore` parameter in `attachWsHandler()`
+- Change `handleAuth()` to async:
   ```typescript
-  const keyInfo = await keyStore.validate(hashKey(msg.key));
+  const keyHash = hashKey(msg.key);
+  const keyInfo = await keyStore.validate(keyHash);
   if (!keyInfo) { /* reject */ }
   ```
-- Pass `keyInfo` to `tunnelManager.register()` (optional, for future org-level limits)
-- Fire-and-forget `keyStore.recordUsage(hashKey(msg.key))`
+- Pass `keyInfo.keyHash` + `keyInfo.orgId` to `tunnelManager.register()`
+- Fire-and-forget `keyStore.recordUsage(keyHash)`
+- Update `handleRegisterTunnel()` to use keyHash from existing tunnel
 
-### Step 10: Write migration script
+### Step 11: Write migration script
 - `scripts/migrate-keys-to-mongo.ts`:
   - Read `keys.json`
   - Create default org "internal" with slug "internal"
-  - Create default user (admin)
+  - Create default admin user
   - Hash each key → insert into api-keys collection
   - Log results
 
-### Step 11: Write tests
+### Step 12: Write tests
 - `mongo-key-store.test.ts`: mock Mongoose models, test validate/recordUsage
 - `json-file-key-store.test.ts`: test with temp JSON file
-- Update `auth.test.ts` or remove if fully replaced
+- Run existing tests — verify no regressions
 
-### Step 12: Run lint + build + test
+### Step 13: Run lint + build + test
 ```bash
 pnpm lint:fix && pnpm build && pnpm test
 ```
@@ -242,9 +282,11 @@ pnpm lint:fix && pnpm build && pnpm test
 - [ ] Create `key-store/mongo-key-store.ts`
 - [ ] Create `key-store/json-file-key-store.ts`
 - [ ] Create `key-store/create-key-store.ts`
+- [ ] Enhance TunnelConnection (apiKeyHash + orgId)
+- [ ] Add countByKeyHash, countByOrg, disconnectByKeyHash to TunnelManager
 - [ ] Update `server.ts` to use KeyStore
-- [ ] Update `ws-handler.ts` to use KeyStore
-- [ ] Remove old `auth.ts` (or deprecate)
+- [ ] Update `ws-handler.ts` to use KeyStore (async validate)
+- [ ] Remove old `auth.ts`
 - [ ] Create migration script
 - [ ] Write unit tests
 - [ ] Run lint + build + test
@@ -253,19 +295,22 @@ pnpm lint:fix && pnpm build && pnpm test
 
 - `MONGO_URI` set → server connects to MongoDB, validates keys via MongoKeyStore
 - `MONGO_URI` not set → server falls back to `keys.json` via JsonFileKeyStore
+- TunnelConnection stores `apiKeyHash` (not raw key) and `orgId`
+- `countByKeyHash()` and `countByOrg()` return correct counts
+- `disconnectByKeyHash()` closes all tunnels for a given key
 - Existing tunnel connections work identically
-- All current tests pass (auth.test.ts adapted)
-- Migration script imports keys.json into MongoDB successfully
+- All current tests pass (adapted for new register signature)
+- Migration script imports keys.json into MongoDB
 - `pnpm build` + `pnpm lint` + `pnpm test` all green
 
 ## Risk Assessment
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Mongoose adds significant bundle size | Low | Low | Tree-shaking, or consider native MongoDB driver instead |
+| Mongoose adds significant bundle size | Low | Low | Acceptable for server-side, no tree-shaking needed |
 | MongoDB connection fails at startup | Medium | High | Fallback to JsonFileKeyStore with warning log |
-| Schema changes break existing tunnels | Low | High | AuthMessage unchanged, only server-side validation path changes |
-| Performance regression from async validate | Low | Low | Auth 1x per connection, <10ms target |
+| register() signature change breaks tests | Medium | Medium | Update all test files referencing register() |
+| async validate() changes ws-handler flow | Medium | Medium | handleAuth becomes async, test carefully |
 
 ## Security Considerations
 
@@ -273,8 +318,9 @@ pnpm lint:fix && pnpm build && pnpm test
 - **keyHash indexed unique** — prevents duplicate key insertion
 - **Org status check** — suspended orgs can't auth even with valid keys
 - **TTL index on expiresAt** — MongoDB auto-removes expired keys
-- **Password hashing** — bcrypt for user passwords (Phase 2, but schema ready)
+- **TunnelConnection stores hash, not raw key** — no plaintext in memory
+- **Password hashing** — bcrypt for user passwords (schema ready, used in Phase 2)
 
 ## Next Steps
-- Phase 2 depends on: MongoDB connection + models + KeyStore working
-- Phase 2 adds: user auth endpoints, admin CRUD API
+- Phase 2 depends on: MongoDB connection + models + KeyStore + TunnelConnection enhancement working
+- Phase 2 adds: Express integration, user auth endpoints, admin CRUD API
