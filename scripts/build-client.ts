@@ -19,13 +19,7 @@ await build({
 		"@tunelo/shared": resolve(root, "packages/shared/src/index.ts"),
 	},
 	// Externalize node builtins and heavy deps that users install
-	external: [
-		"socket.io-client",
-		"chalk",
-		"commander",
-		"pino",
-		"ws",
-	],
+	external: ["chalk", "commander", "pino", "ws"],
 	banner: {
 		js: "#!/usr/bin/env node\n// Tunelo CLI — bundled with esbuild",
 	},

@@ -30,8 +30,5 @@
 		"node": ">=20"
 	},
 	"packageManager": "pnpm@9.15.0",
-	"dependencies": {
-		"socket.io": "^4.8.3",
-		"socket.io-client": "^4.8.3"
-	}
+	"dependencies": {}
 }

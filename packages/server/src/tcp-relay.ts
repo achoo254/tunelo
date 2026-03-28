@@ -2,13 +2,10 @@
 
 import { randomUUID } from "node:crypto";
 import net from "node:net";
-import {
-	type ClientToServerEvents,
-	DEFAULTS,
-	type ServerToClientEvents,
-} from "@tunelo/shared";
-import type { Socket } from "socket.io";
+import { DEFAULTS } from "@tunelo/shared";
+import type { WebSocket } from "ws";
 import { createLogger } from "./logger.js";
+import { safeSend } from "./ws-send.js";
 
 const logger = createLogger("tunelo-tcp-relay");
 
@@ -31,7 +28,7 @@ export interface TcpRelay {
 
 export function createTcpRelay(
 	remotePort: number,
-	wsSocket: Socket<ClientToServerEvents, ServerToClientEvents>,
+	wsSocket: WebSocket,
 	onConnection?: (connectionId: string) => void,
 ): TcpRelay {
 	const connections = new Map<string, TcpConnection>();
@@ -85,7 +82,7 @@ export function createTcpRelay(
 		);
 
 		// Notify client of new connection
-		wsSocket.emit("tcp-connection-open", {
+		safeSend(wsSocket, {
 			type: "tcp-connection-open",
 			connectionId,
 			remotePort,
@@ -96,7 +93,7 @@ export function createTcpRelay(
 		tcpSocket.on("data", (chunk: Buffer) => {
 			clearTimeout(conn.idleTimer);
 			conn.idleTimer = resetIdle();
-			wsSocket.emit("tcp-data", {
+			safeSend(wsSocket, {
 				type: "tcp-data",
 				connectionId,
 				data: chunk.toString("base64"),
@@ -106,7 +103,7 @@ export function createTcpRelay(
 		tcpSocket.on("close", () => {
 			clearTimeout(conn.idleTimer);
 			connections.delete(connectionId);
-			wsSocket.emit("tcp-connection-close", {
+			safeSend(wsSocket, {
 				type: "tcp-connection-close",
 				connectionId,
 			});

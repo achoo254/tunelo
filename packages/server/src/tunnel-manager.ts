@@ -1,13 +1,9 @@
-import type {
-	ClientToServerEvents,
-	ServerToClientEvents,
-	TunnelRequest,
-	TunnelResponse,
-} from "@tunelo/shared";
+import type { TunnelRequest, TunnelResponse } from "@tunelo/shared";
 import { DEFAULTS, ErrorCode } from "@tunelo/shared";
-import type { Socket } from "socket.io";
+import type { WebSocket } from "ws";
 import { createLogger } from "./logger.js";
 import { checkBasicAuth, hashCredentials } from "./tunnel-auth-checker.js";
+import { safeSend } from "./ws-send.js";
 
 const logger = createLogger("tunelo-tunnel-manager");
 
@@ -18,7 +14,9 @@ interface PendingRequest {
 }
 
 export interface TunnelConnection {
-	socket: Socket<ClientToServerEvents, ServerToClientEvents>;
+	socket: WebSocket;
+	/** Unique connection ID for tracking across reconnects */
+	connectionId: string;
 	apiKey: string;
 	subdomain: string;
 	connectedAt: Date;
@@ -36,7 +34,8 @@ class TunnelManager {
 
 	register(
 		subdomain: string,
-		socket: Socket<ClientToServerEvents, ServerToClientEvents>,
+		socket: WebSocket,
+		connectionId: string,
 		apiKey: string,
 		auth?: string,
 	): boolean {
@@ -63,6 +62,7 @@ class TunnelManager {
 
 		this.tunnels.set(subdomain, {
 			socket,
+			connectionId,
 			apiKey,
 			subdomain,
 			connectedAt: new Date(),
@@ -126,19 +126,19 @@ class TunnelManager {
 		return this.tunnels.has(subdomain);
 	}
 
-	/** Unregister all subdomains associated with a specific socket */
-	unregisterBySocket(socketId: string): void {
-		const subdomains = this.getSubdomainsBySocket(socketId);
+	/** Unregister all subdomains associated with a specific connection */
+	unregisterByConnectionId(connectionId: string): void {
+		const subdomains = this.getSubdomainsByConnectionId(connectionId);
 		for (const subdomain of subdomains) {
 			this.unregister(subdomain);
 		}
 	}
 
-	/** Get all subdomains registered on a specific socket */
-	getSubdomainsBySocket(socketId: string): string[] {
+	/** Get all subdomains registered on a specific connection */
+	getSubdomainsByConnectionId(connectionId: string): string[] {
 		const subdomains: string[] = [];
 		for (const [subdomain, tunnel] of this.tunnels) {
-			if (tunnel.socket.id === socketId) subdomains.push(subdomain);
+			if (tunnel.connectionId === connectionId) subdomains.push(subdomain);
 		}
 		return subdomains;
 	}
@@ -165,15 +165,18 @@ class TunnelManager {
 			}, DEFAULTS.REQUEST_TIMEOUT_MS);
 
 			tunnel.pendingRequests.set(request.id, { resolve, reject, timer });
-			tunnel.socket.emit("request", request);
+			safeSend(tunnel.socket, request);
 		});
 	}
 
-	/** Handle response from client — search all subdomains for this socket to find matching pending request */
-	handleResponseBySocket(socketId: string, response: TunnelResponse): void {
-		// Try all subdomains belonging to this socket
+	/** Handle response from client — search all subdomains for this connection to find matching pending request */
+	handleResponseByConnectionId(
+		connectionId: string,
+		response: TunnelResponse,
+	): void {
+		// Try all subdomains belonging to this connection
 		for (const [subdomain, tunnel] of this.tunnels) {
-			if (tunnel.socket.id !== socketId) continue;
+			if (tunnel.connectionId !== connectionId) continue;
 			const pending = tunnel.pendingRequests.get(response.id);
 			if (pending) {
 				clearTimeout(pending.timer);
@@ -222,7 +225,7 @@ class TunnelManager {
 		this.orphanedRequests.clear();
 
 		for (const [subdomain, tunnel] of this.tunnels) {
-			tunnel.socket.disconnect(true);
+			tunnel.socket.close();
 			this.unregister(subdomain);
 		}
 	}

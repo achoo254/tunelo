@@ -2,16 +2,19 @@ import { EventEmitter } from "node:events";
 import {
 	type AuthMessage,
 	type AuthResult,
-	type ClientToServerEvents,
 	DEFAULTS,
 	type RegisterTunnelMessage,
 	type RegisterTunnelResult,
-	type ServerToClientEvents,
+	type ServerToClientMessage,
+	type TcpConnectionClose,
+	type TcpConnectionOpen,
+	type TcpDataMessage,
 	type TcpRegisterMessage,
 	type TcpRegisterResult,
 	type TunnelRequest,
+	parseMessage,
 } from "@tunelo/shared";
-import { type Socket, io } from "socket.io-client";
+import WebSocket from "ws";
 import { proxyRequest } from "./local-proxy.js";
 import type { TunnelMapping } from "./tunnel-config-parser.js";
 
@@ -28,8 +31,7 @@ export interface TunnelClientOptions {
 }
 
 export class TunnelClient extends EventEmitter {
-	private socket: Socket<ServerToClientEvents, ClientToServerEvents> | null =
-		null;
+	private socket: WebSocket | null = null;
 	private stopped = false;
 	private attempts = 0;
 	private readonly options: TunnelClientOptions;
@@ -43,77 +45,65 @@ export class TunnelClient extends EventEmitter {
 
 	connect(): Promise<AuthResult> {
 		return new Promise((resolve, reject) => {
-			this.socket = io(this.options.serverUrl, {
-				path: DEFAULTS.WS_PATH,
-				transports: ["websocket", "polling"],
-				reconnection: false,
-			});
+			const wsUrl = this.buildWsUrl();
+			this.socket = new WebSocket(wsUrl);
 
 			let authResolved = false;
 
-			this.socket.on("connect", () => {
+			this.socket.on("open", () => {
 				const authMsg: AuthMessage = {
 					type: "auth",
 					key: this.options.apiKey,
 					subdomain: this.options.subdomain ?? "",
 					auth: this.options.auth,
 				};
-				this.socket?.emit("auth", authMsg);
+				this.socket?.send(JSON.stringify(authMsg));
 			});
 
-			this.socket.on("auth-result", (result: AuthResult) => {
-				if (authResolved) return;
-				authResolved = true;
-
-				if (!result.success) {
-					this.socket?.disconnect();
-					reject(new Error(result.error ?? "Auth failed"));
+			this.socket.on("message", (data) => {
+				let msg: ServerToClientMessage;
+				try {
+					msg = parseMessage(data.toString()) as ServerToClientMessage;
+				} catch {
 					return;
 				}
-				this.attempts = 0;
-				// Map initial tunnel's subdomain to primary port
-				this.subdomainPortMap.set(result.subdomain, this.options.localPort);
-				this.emit("connected", result);
 
-				// Register additional tunnels after initial auth
-				this.registerAdditionalTunnels();
-				resolve(result);
-			});
-
-			// Handle additional tunnel registration results
-			this.socket.on(
-				"register-tunnel-result",
-				(result: RegisterTunnelResult) => {
-					if (result.success) {
-						this.subdomainPortMap.set(result.subdomain, result.localPort);
-						this.emit("tunnel-registered", result);
-					} else {
-						this.emit("tunnel-register-error", result);
-					}
-				},
-			);
-
-			// Handle TCP registration results
-			this.socket.on("tcp-register-result", (result: TcpRegisterResult) => {
-				if (result.success) {
-					this.emit("tcp-registered", result);
-				} else {
-					this.emit("tcp-register-error", result);
+				switch (msg.type) {
+					case "auth-result":
+						this.handleAuthResult(msg, authResolved, resolve, reject);
+						if (!authResolved) authResolved = true;
+						break;
+					case "register-tunnel-result":
+						this.handleRegisterTunnelResult(msg);
+						break;
+					case "tcp-register-result":
+						this.handleTcpRegisterResult(msg);
+						break;
+					case "request":
+						this.handleRequest(msg);
+						break;
+					case "tcp-connection-open":
+						this.emit("tcp-connection-open", msg);
+						break;
+					case "tcp-data":
+						this.emit("tcp-data", msg);
+						break;
+					case "tcp-connection-close":
+						this.emit("tcp-connection-close", msg);
+						break;
+					default:
+						break;
 				}
 			});
 
-			this.socket.on("request", (request: TunnelRequest) => {
-				this.handleRequest(request);
-			});
-
-			this.socket.on("disconnect", () => {
+			this.socket.on("close", () => {
 				this.emit("disconnected");
 				if (!this.stopped && authResolved) {
 					this.reconnect();
 				}
 			});
 
-			this.socket.on("connect_error", (err: Error) => {
+			this.socket.on("error", (err: Error) => {
 				if (!authResolved) {
 					authResolved = true;
 					reject(err);
@@ -125,7 +115,7 @@ export class TunnelClient extends EventEmitter {
 
 	disconnect(): void {
 		this.stopped = true;
-		this.socket?.disconnect();
+		this.socket?.close();
 	}
 
 	/** Register a TCP tunnel after auth */
@@ -135,12 +125,64 @@ export class TunnelClient extends EventEmitter {
 			localPort,
 			remotePort,
 		};
-		this.socket?.emit("tcp-register", msg);
+		this.sendMsg(msg);
 	}
 
 	/** Get raw socket for TcpProxy to attach handlers */
-	getSocket(): typeof this.socket {
+	getSocket(): WebSocket | null {
 		return this.socket;
+	}
+
+	/** Send a JSON message over the WebSocket */
+	sendMsg(msg: unknown): void {
+		if (this.socket?.readyState === WebSocket.OPEN) {
+			this.socket.send(JSON.stringify(msg));
+		}
+	}
+
+	private buildWsUrl(): string {
+		// Convert http(s) to ws(s) and append WS_PATH
+		const url = this.options.serverUrl
+			.replace(/^https:\/\//, "wss://")
+			.replace(/^http:\/\//, "ws://");
+		return `${url}${DEFAULTS.WS_PATH}`;
+	}
+
+	private handleAuthResult(
+		result: AuthResult,
+		alreadyResolved: boolean,
+		resolve: (r: AuthResult) => void,
+		reject: (e: Error) => void,
+	): void {
+		if (alreadyResolved) return;
+
+		if (!result.success) {
+			this.socket?.close();
+			reject(new Error(result.error ?? "Auth failed"));
+			return;
+		}
+		this.attempts = 0;
+		this.subdomainPortMap.set(result.subdomain, this.options.localPort);
+		this.emit("connected", result);
+		this.registerAdditionalTunnels();
+		resolve(result);
+	}
+
+	private handleRegisterTunnelResult(result: RegisterTunnelResult): void {
+		if (result.success) {
+			this.subdomainPortMap.set(result.subdomain, result.localPort);
+			this.emit("tunnel-registered", result);
+		} else {
+			this.emit("tunnel-register-error", result);
+		}
+	}
+
+	private handleTcpRegisterResult(result: TcpRegisterResult): void {
+		if (result.success) {
+			this.emit("tcp-registered", result);
+		} else {
+			this.emit("tcp-register-error", result);
+		}
 	}
 
 	private registerAdditionalTunnels(): void {
@@ -154,13 +196,12 @@ export class TunnelClient extends EventEmitter {
 				localPort: tunnel.port,
 				auth: this.options.auth,
 			};
-			this.socket?.emit("register-tunnel", msg);
+			this.sendMsg(msg);
 		}
 	}
 
 	private async handleRequest(request: TunnelRequest): Promise<void> {
 		const start = Date.now();
-		// Route by subdomain for multi-tunnel, fallback to primary port
 		const targetPort = request.subdomain
 			? (this.subdomainPortMap.get(request.subdomain) ?? this.options.localPort)
 			: this.options.localPort;
@@ -170,7 +211,7 @@ export class TunnelClient extends EventEmitter {
 			targetPort,
 			this.options.localHost,
 		);
-		this.socket?.emit("response", response);
+		this.sendMsg(response);
 		const durationMs = Date.now() - start;
 
 		this.emit("request", {
@@ -181,7 +222,6 @@ export class TunnelClient extends EventEmitter {
 			subdomain: request.subdomain,
 		});
 
-		// Emit full data for inspector
 		this.emit("inspector-entry", {
 			id: request.id,
 			timestamp: start,

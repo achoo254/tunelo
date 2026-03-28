@@ -1,100 +1,109 @@
 /** TCP tunnel WebSocket event handlers — handles tcp-register, tcp-data, tcp-connection-close */
 
 import {
-	type ClientToServerEvents,
 	DEFAULTS,
-	type ServerToClientEvents,
 	TUNNEL_DOMAIN,
 	type TcpRegisterMessage,
 } from "@tunelo/shared";
-import type { Socket } from "socket.io";
+import type { WebSocket } from "ws";
 import { createLogger } from "./logger.js";
 import { tcpPortManager } from "./tcp-port-manager.js";
 import { type TcpRelay, createTcpRelay } from "./tcp-relay.js";
+import { safeSend } from "./ws-send.js";
 
 const logger = createLogger("tunelo-tcp-ws");
 
-/** Attach TCP tunnel handlers to an authenticated socket */
-export function attachTcpHandlers(
-	socket: Socket<ClientToServerEvents, ServerToClientEvents>,
+/** Per-connection TCP state — created after auth, cleaned up on close */
+export interface TcpConnectionState {
+	relays: Map<number, TcpRelay>;
+	connectionToRelay: Map<string, TcpRelay>;
+}
+
+export function createTcpState(): TcpConnectionState {
+	return { relays: new Map(), connectionToRelay: new Map() };
+}
+
+export function handleTcpRegister(
+	ws: WebSocket,
+	connectionId: string,
+	msg: TcpRegisterMessage,
+	state: TcpConnectionState,
 ): void {
-	const relays = new Map<number, TcpRelay>();
-	/** Maps connectionId → relay for direct routing */
-	const connectionToRelay = new Map<string, TcpRelay>();
+	const port = tcpPortManager.allocate(
+		connectionId,
+		msg.localPort,
+		msg.remotePort,
+	);
+	if (port === null) {
+		safeSend(ws, {
+			type: "tcp-register-result",
+			success: false,
+			localPort: msg.localPort,
+			remotePort: 0,
+			url: "",
+			error: "No TCP ports available",
+		});
+		return;
+	}
 
-	socket.on("tcp-register", (msg: TcpRegisterMessage) => {
-		const port = tcpPortManager.allocate(
-			socket.id,
-			msg.localPort,
-			msg.remotePort,
+	try {
+		const relay = createTcpRelay(port, ws, (connId) => {
+			state.connectionToRelay.set(connId, relay);
+		});
+		state.relays.set(port, relay);
+
+		const url = `tcp://${TUNNEL_DOMAIN}:${port}`;
+		safeSend(ws, {
+			type: "tcp-register-result",
+			success: true,
+			localPort: msg.localPort,
+			remotePort: port,
+			url,
+		});
+		logger.info(
+			{ remotePort: port, localPort: msg.localPort, url },
+			"TCP tunnel registered",
 		);
-		if (port === null) {
-			socket.emit("tcp-register-result", {
-				type: "tcp-register-result",
-				success: false,
-				localPort: msg.localPort,
-				remotePort: 0,
-				url: "",
-				error: "No TCP ports available",
-			});
-			return;
-		}
+	} catch (err) {
+		tcpPortManager.release(port);
+		safeSend(ws, {
+			type: "tcp-register-result",
+			success: false,
+			localPort: msg.localPort,
+			remotePort: port,
+			url: "",
+			error: (err as Error).message,
+		});
+	}
+}
 
-		try {
-			const relay = createTcpRelay(port, socket, (connId) => {
-				connectionToRelay.set(connId, relay);
-			});
-			relays.set(port, relay);
+export function handleTcpData(
+	msg: { connectionId: string; data: string },
+	state: TcpConnectionState,
+): void {
+	const relay = state.connectionToRelay.get(msg.connectionId);
+	if (relay) {
+		relay.writeToConnection(msg.connectionId, Buffer.from(msg.data, "base64"));
+	}
+}
 
-			const url = `tcp://${TUNNEL_DOMAIN}:${port}`;
-			socket.emit("tcp-register-result", {
-				type: "tcp-register-result",
-				success: true,
-				localPort: msg.localPort,
-				remotePort: port,
-				url,
-			});
-			logger.info(
-				{ remotePort: port, localPort: msg.localPort, url },
-				"TCP tunnel registered",
-			);
-		} catch (err) {
-			tcpPortManager.release(port);
-			socket.emit("tcp-register-result", {
-				type: "tcp-register-result",
-				success: false,
-				localPort: msg.localPort,
-				remotePort: port,
-				url: "",
-				error: (err as Error).message,
-			});
-		}
-	});
+export function handleTcpConnectionClose(
+	msg: { connectionId: string },
+	state: TcpConnectionState,
+): void {
+	const relay = state.connectionToRelay.get(msg.connectionId);
+	if (relay) {
+		relay.closeConnection(msg.connectionId);
+		state.connectionToRelay.delete(msg.connectionId);
+	}
+}
 
-	// Forward WS data to correct TCP connection via connectionId→relay map
-	socket.on("tcp-data", (msg) => {
-		const relay = connectionToRelay.get(msg.connectionId);
-		if (relay) {
-			relay.writeToConnection(msg.connectionId, Buffer.from(msg.data, "base64"));
-		}
-	});
-
-	// Client closed a TCP connection
-	socket.on("tcp-connection-close", (msg) => {
-		const relay = connectionToRelay.get(msg.connectionId);
-		if (relay) {
-			relay.closeConnection(msg.connectionId);
-			connectionToRelay.delete(msg.connectionId);
-		}
-	});
-
-	// Cleanup on disconnect
-	socket.on("disconnect", () => {
-		connectionToRelay.clear();
-		for (const [port, relay] of relays) {
-			relay.close();
-			tcpPortManager.release(port);
-		}
-		relays.clear();
-	});
+/** Clean up all TCP relays for a disconnected connection */
+export function cleanupTcpState(state: TcpConnectionState): void {
+	state.connectionToRelay.clear();
+	for (const [port, relay] of state.relays) {
+		relay.close();
+		tcpPortManager.release(port);
+	}
+	state.relays.clear();
 }

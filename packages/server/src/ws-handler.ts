@@ -1,216 +1,274 @@
+import { randomUUID } from "node:crypto";
 import type http from "node:http";
 import {
 	type AuthMessage,
-	type ClientToServerEvents,
+	type ClientToServerMessage,
 	DEFAULTS,
 	ErrorCode,
 	type RegisterTunnelMessage,
 	SUBDOMAIN_REGEX,
-	type ServerToClientEvents,
+	WS_CLOSE_CODES,
 	buildTunnelUrl,
+	parseMessage,
 } from "@tunelo/shared";
 import { customAlphabet } from "nanoid";
-import { type Socket, Server as SocketIOServer } from "socket.io";
+import { type WebSocket, WebSocketServer } from "ws";
 import { validateApiKey } from "./auth.js";
 import { createLogger } from "./logger.js";
-import { attachTcpHandlers } from "./tcp-ws-handler.js";
+import {
+	type TcpConnectionState,
+	cleanupTcpState,
+	createTcpState,
+	handleTcpConnectionClose,
+	handleTcpData,
+	handleTcpRegister,
+} from "./tcp-ws-handler.js";
 import { tunnelManager } from "./tunnel-manager.js";
+import { safeSend } from "./ws-send.js";
 
+const generateSubdomain = customAlphabet(
+	"abcdefghijklmnopqrstuvwxyz0123456789",
+	8,
+);
 const logger = createLogger("tunelo-ws");
 
+/** Per-connection state attached after upgrade */
+interface ConnectionState {
+	id: string;
+	authenticated: boolean;
+	subdomain: string;
+	messageCount: number;
+	rateLimitInterval: ReturnType<typeof setInterval>;
+	authTimer: ReturnType<typeof setTimeout>;
+	pingInterval: ReturnType<typeof setInterval> | null;
+	tcpState: TcpConnectionState;
+	alive: boolean;
+}
+
 export function attachWsHandler(server: http.Server): void {
-	const io = new SocketIOServer<ClientToServerEvents, ServerToClientEvents>(
-		server,
-		{
-			path: DEFAULTS.WS_PATH,
-			// Ping/pong handled by socket.io engine
-			pingInterval: DEFAULTS.PING_INTERVAL_MS,
-			pingTimeout: DEFAULTS.PING_INTERVAL_MS,
-			// Max payload 10MB
-			maxHttpBufferSize: DEFAULTS.MAX_BODY_SIZE,
-			// Allow Cloudflare proxy
-			cors: { origin: "*" },
-			// Use websocket transport, fallback to polling for Cloudflare compat
-			transports: ["websocket", "polling"],
-		},
-	);
+	const wss = new WebSocketServer({
+		noServer: true,
+		maxPayload: DEFAULTS.MAX_BODY_SIZE,
+	});
 
-	io.on(
-		"connection",
-		(socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
-			let authenticated = false;
-			let subdomain = "";
+	server.on("upgrade", (req, socket, head) => {
+		const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+		if (pathname !== DEFAULTS.WS_PATH) {
+			socket.destroy();
+			return;
+		}
+		wss.handleUpgrade(req, socket, head, (ws) => {
+			wss.emit("connection", ws, req);
+		});
+	});
 
-			// Rate limiting: max 100 messages per second
-			let messageCount = 0;
-			const rateLimitInterval = setInterval(() => {
-				messageCount = 0;
-			}, 1000);
-
-			// Auth timeout — client must auth within 10s
-			const authTimer = setTimeout(() => {
-				if (!authenticated) {
-					socket.emit("auth-result", {
+	wss.on("connection", (ws: WebSocket) => {
+		const state: ConnectionState = {
+			id: randomUUID(),
+			authenticated: false,
+			subdomain: "",
+			messageCount: 0,
+			rateLimitInterval: setInterval(() => {
+				state.messageCount = 0;
+			}, 1000),
+			authTimer: setTimeout(() => {
+				if (!state.authenticated) {
+					safeSend(ws, {
 						type: "auth-result",
 						success: false,
 						subdomain: "",
 						url: "",
 						error: "Auth timeout",
 					});
-					socket.disconnect(true);
+					ws.close(WS_CLOSE_CODES.AUTH_TIMEOUT, "Auth timeout");
 				}
-			}, 10_000);
+			}, 10_000),
+			pingInterval: null,
+			tcpState: createTcpState(),
+			alive: true,
+		};
 
-			// Handle auth
-			socket.on("auth", (msg: AuthMessage) => {
-				messageCount++;
-				if (messageCount > DEFAULTS.WS_RATE_LIMIT) {
-					logger.warn({ subdomain }, "Rate limit exceeded");
-					return;
-				}
+		// Native ping/pong keepalive
+		state.pingInterval = setInterval(() => {
+			if (!state.alive) {
+				ws.terminate();
+				return;
+			}
+			state.alive = false;
+			ws.ping();
+		}, DEFAULTS.PING_INTERVAL_MS);
 
-				if (authenticated) return;
+		ws.on("pong", () => {
+			state.alive = true;
+		});
 
-				clearTimeout(authTimer);
+		ws.on("message", (data) => {
+			state.messageCount++;
+			if (state.messageCount > DEFAULTS.WS_RATE_LIMIT) {
+				logger.warn({ subdomain: state.subdomain }, "Rate limit exceeded");
+				return;
+			}
 
-				if (!validateApiKey(msg.key)) {
-					socket.emit("auth-result", {
-						type: "auth-result",
-						success: false,
-						subdomain: "",
-						url: "",
-						error: "Invalid API key",
-					});
-					socket.disconnect(true);
-					return;
-				}
+			let msg: ClientToServerMessage;
+			try {
+				msg = parseMessage(data.toString()) as ClientToServerMessage;
+			} catch {
+				logger.warn({ connectionId: state.id }, "Invalid JSON message");
+				return;
+			}
 
-				const generateSubdomain = customAlphabet(
-					"abcdefghijklmnopqrstuvwxyz0123456789",
-					8,
-				);
-				const requestedSubdomain = msg.subdomain || generateSubdomain();
+			switch (msg.type) {
+				case "auth":
+					handleAuth(ws, state, msg);
+					break;
+				case "register-tunnel":
+					handleRegisterTunnel(ws, state, msg);
+					break;
+				case "response":
+					if (!state.authenticated) return;
+					tunnelManager.handleResponseByConnectionId(state.id, msg);
+					break;
+				case "tcp-register":
+					if (!state.authenticated) return;
+					handleTcpRegister(ws, state.id, msg, state.tcpState);
+					break;
+				case "tcp-data":
+					if (!state.authenticated) return;
+					handleTcpData(msg, state.tcpState);
+					break;
+				case "tcp-connection-close":
+					if (!state.authenticated) return;
+					handleTcpConnectionClose(msg, state.tcpState);
+					break;
+				case "pong":
+					// Application-level pong — no-op, we use native WS pong
+					break;
+				default:
+					break;
+			}
+		});
 
-				if (!SUBDOMAIN_REGEX.test(requestedSubdomain)) {
-					socket.emit("auth-result", {
-						type: "auth-result",
-						success: false,
-						subdomain: requestedSubdomain,
-						url: "",
-						error: "Invalid subdomain format",
-					});
-					socket.disconnect(true);
-					return;
-				}
+		ws.on("close", () => {
+			clearTimeout(state.authTimer);
+			clearInterval(state.rateLimitInterval);
+			if (state.pingInterval) clearInterval(state.pingInterval);
+			cleanupTcpState(state.tcpState);
+			if (state.subdomain) tunnelManager.unregisterByConnectionId(state.id);
+		});
 
-				if (
-					!tunnelManager.register(requestedSubdomain, socket, msg.key, msg.auth)
-				) {
-					socket.emit("auth-result", {
-						type: "auth-result",
-						success: false,
-						subdomain: requestedSubdomain,
-						url: "",
-						error: "Subdomain already in use",
-					});
-					socket.disconnect(true);
-					return;
-				}
+		ws.on("error", (err) => {
+			logger.error({ err, subdomain: state.subdomain }, "Socket error");
+		});
+	});
+}
 
-				authenticated = true;
-				subdomain = requestedSubdomain;
-				const url = buildTunnelUrl(subdomain);
+function handleAuth(
+	ws: WebSocket,
+	state: ConnectionState,
+	msg: AuthMessage,
+): void {
+	if (state.authenticated) return;
+	clearTimeout(state.authTimer);
 
-				socket.emit("auth-result", {
-					type: "auth-result",
-					success: true,
-					subdomain,
-					url,
-				});
-				logger.info({ subdomain, url }, "Client authenticated");
+	if (!validateApiKey(msg.key)) {
+		safeSend(ws, {
+			type: "auth-result",
+			success: false,
+			subdomain: "",
+			url: "",
+			error: "Invalid API key",
+		});
+		ws.close(WS_CLOSE_CODES.AUTH_FAILED, "Invalid API key");
+		return;
+	}
 
-				// Attach TCP tunnel handlers after successful auth
-				attachTcpHandlers(socket);
-			});
+	const requestedSubdomain = msg.subdomain || generateSubdomain();
 
-			// Handle additional tunnel registration on same socket
-			socket.on("register-tunnel", (msg: RegisterTunnelMessage) => {
-				messageCount++;
-				if (messageCount > DEFAULTS.WS_RATE_LIMIT) {
-					logger.warn({ subdomain }, "Rate limit exceeded");
-					return;
-				}
-				if (!authenticated) return;
+	if (!SUBDOMAIN_REGEX.test(requestedSubdomain)) {
+		safeSend(ws, {
+			type: "auth-result",
+			success: false,
+			subdomain: requestedSubdomain,
+			url: "",
+			error: "Invalid subdomain format",
+		});
+		ws.close(WS_CLOSE_CODES.AUTH_FAILED, "Invalid subdomain");
+		return;
+	}
 
-				const generateSubdomain = customAlphabet(
-					"abcdefghijklmnopqrstuvwxyz0123456789",
-					8,
-				);
-				const requestedSubdomain = msg.subdomain || generateSubdomain();
+	if (
+		!tunnelManager.register(requestedSubdomain, ws, state.id, msg.key, msg.auth)
+	) {
+		safeSend(ws, {
+			type: "auth-result",
+			success: false,
+			subdomain: requestedSubdomain,
+			url: "",
+			error: "Subdomain already in use",
+		});
+		ws.close(WS_CLOSE_CODES.SUBDOMAIN_TAKEN, "Subdomain taken");
+		return;
+	}
 
-				if (!SUBDOMAIN_REGEX.test(requestedSubdomain)) {
-					socket.emit("register-tunnel-result", {
-						type: "register-tunnel-result",
-						success: false,
-						subdomain: requestedSubdomain,
-						localPort: msg.localPort,
-						url: "",
-						error: "Invalid subdomain format",
-					});
-					return;
-				}
+	state.authenticated = true;
+	state.subdomain = requestedSubdomain;
+	const url = buildTunnelUrl(requestedSubdomain);
 
-				const apiKey = tunnelManager.get(subdomain)?.apiKey ?? "";
-				if (
-					!tunnelManager.register(requestedSubdomain, socket, apiKey, msg.auth)
-				) {
-					socket.emit("register-tunnel-result", {
-						type: "register-tunnel-result",
-						success: false,
-						subdomain: requestedSubdomain,
-						localPort: msg.localPort,
-						url: "",
-						error: "Subdomain already in use",
-					});
-					return;
-				}
+	safeSend(ws, {
+		type: "auth-result",
+		success: true,
+		subdomain: requestedSubdomain,
+		url,
+	});
+	logger.info({ subdomain: requestedSubdomain, url }, "Client authenticated");
+}
 
-				const url = buildTunnelUrl(requestedSubdomain);
-				socket.emit("register-tunnel-result", {
-					type: "register-tunnel-result",
-					success: true,
-					subdomain: requestedSubdomain,
-					localPort: msg.localPort,
-					url,
-				});
-				logger.info(
-					{ subdomain: requestedSubdomain, url, localPort: msg.localPort },
-					"Additional tunnel registered",
-				);
-			});
+function handleRegisterTunnel(
+	ws: WebSocket,
+	state: ConnectionState,
+	msg: RegisterTunnelMessage,
+): void {
+	if (!state.authenticated) return;
 
-			// Handle tunnel responses from client
-			socket.on("response", (response) => {
-				messageCount++;
-				if (messageCount > DEFAULTS.WS_RATE_LIMIT) {
-					logger.warn({ subdomain }, "Rate limit exceeded, dropping message");
-					return;
-				}
-				if (!authenticated) return;
-				// Use socket-based lookup for multi-tunnel support
-				tunnelManager.handleResponseBySocket(socket.id, response);
-			});
+	const requestedSubdomain = msg.subdomain || generateSubdomain();
 
-			socket.on("disconnect", () => {
-				clearTimeout(authTimer);
-				clearInterval(rateLimitInterval);
-				// Unregister all subdomains for this socket (multi-tunnel support)
-				if (subdomain) tunnelManager.unregisterBySocket(socket.id);
-			});
+	if (!SUBDOMAIN_REGEX.test(requestedSubdomain)) {
+		safeSend(ws, {
+			type: "register-tunnel-result",
+			success: false,
+			subdomain: requestedSubdomain,
+			localPort: msg.localPort,
+			url: "",
+			error: "Invalid subdomain format",
+		});
+		return;
+	}
 
-			socket.on("error", (err) => {
-				logger.error({ err, subdomain }, "Socket error");
-			});
-		},
+	const apiKey = tunnelManager.get(state.subdomain)?.apiKey ?? "";
+	if (
+		!tunnelManager.register(requestedSubdomain, ws, state.id, apiKey, msg.auth)
+	) {
+		safeSend(ws, {
+			type: "register-tunnel-result",
+			success: false,
+			subdomain: requestedSubdomain,
+			localPort: msg.localPort,
+			url: "",
+			error: "Subdomain already in use",
+		});
+		return;
+	}
+
+	const url = buildTunnelUrl(requestedSubdomain);
+	safeSend(ws, {
+		type: "register-tunnel-result",
+		success: true,
+		subdomain: requestedSubdomain,
+		localPort: msg.localPort,
+		url,
+	});
+	logger.info(
+		{ subdomain: requestedSubdomain, url, localPort: msg.localPort },
+		"Additional tunnel registered",
 	);
 }

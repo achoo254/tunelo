@@ -2,13 +2,11 @@
 
 import net from "node:net";
 import type {
-	ClientToServerEvents,
-	ServerToClientEvents,
 	TcpConnectionClose,
 	TcpConnectionOpen,
 	TcpDataMessage,
 } from "@tunelo/shared";
-import type { Socket } from "socket.io-client";
+import type { TunnelClient } from "./tunnel-client.js";
 
 interface LocalTcpConnection {
 	socket: net.Socket;
@@ -17,31 +15,31 @@ interface LocalTcpConnection {
 
 export class TcpProxy {
 	private connections = new Map<string, LocalTcpConnection>();
-	private readonly wsSocket: Socket<ServerToClientEvents, ClientToServerEvents>;
+	private readonly client: TunnelClient;
 	private readonly localPort: number;
 	private readonly localHost: string;
 
 	constructor(
-		wsSocket: Socket<ServerToClientEvents, ClientToServerEvents>,
+		client: TunnelClient,
 		localPort: number,
 		localHost = "127.0.0.1",
 	) {
-		this.wsSocket = wsSocket;
+		this.client = client;
 		this.localPort = localPort;
 		this.localHost = localHost;
 		this.setupHandlers();
 	}
 
 	private setupHandlers(): void {
-		this.wsSocket.on("tcp-connection-open", (msg: TcpConnectionOpen) => {
+		this.client.on("tcp-connection-open", (msg: TcpConnectionOpen) => {
 			this.handleConnectionOpen(msg);
 		});
 
-		this.wsSocket.on("tcp-data", (msg: TcpDataMessage) => {
+		this.client.on("tcp-data", (msg: TcpDataMessage) => {
 			this.handleData(msg);
 		});
 
-		this.wsSocket.on("tcp-connection-close", (msg: TcpConnectionClose) => {
+		this.client.on("tcp-connection-close", (msg: TcpConnectionClose) => {
 			this.handleConnectionClose(msg);
 		});
 	}
@@ -60,7 +58,7 @@ export class TcpProxy {
 
 		// Forward local data to server via WS
 		localSocket.on("data", (chunk: Buffer) => {
-			this.wsSocket.emit("tcp-data", {
+			this.client.sendMsg({
 				type: "tcp-data",
 				connectionId: msg.connectionId,
 				data: chunk.toString("base64"),
@@ -69,7 +67,7 @@ export class TcpProxy {
 
 		localSocket.on("close", () => {
 			this.connections.delete(msg.connectionId);
-			this.wsSocket.emit("tcp-connection-close", {
+			this.client.sendMsg({
 				type: "tcp-connection-close",
 				connectionId: msg.connectionId,
 			});
@@ -78,7 +76,7 @@ export class TcpProxy {
 		localSocket.on("error", () => {
 			localSocket.destroy();
 			this.connections.delete(msg.connectionId);
-			this.wsSocket.emit("tcp-connection-close", {
+			this.client.sendMsg({
 				type: "tcp-connection-close",
 				connectionId: msg.connectionId,
 			});

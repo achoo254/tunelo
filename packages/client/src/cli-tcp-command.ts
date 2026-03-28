@@ -52,10 +52,7 @@ export function registerTcpCommand(program: Command, display: Display): void {
 
 				client.on("tcp-registered", (result: TcpRegisterResult) => {
 					display.showTcpTunnel(result.url, port);
-					const socket = client.getSocket();
-					if (socket) {
-						new TcpProxy(socket, port);
-					}
+					new TcpProxy(client, port);
 				});
 
 				client.on("tcp-register-error", (result: TcpRegisterResult) => {

@@ -129,26 +129,20 @@ export type ClientToServerMessage =
 	| PongMessage;
 export type TunnelMessage = ServerToClientMessage | ClientToServerMessage;
 
-/** Socket.IO typed events for server ↔ client communication */
-export interface ServerToClientEvents {
-	"auth-result": (result: AuthResult) => void;
-	"register-tunnel-result": (result: RegisterTunnelResult) => void;
-	"tcp-register-result": (result: TcpRegisterResult) => void;
-	"tcp-connection-open": (msg: TcpConnectionOpen) => void;
-	"tcp-data": (msg: TcpDataMessage) => void;
-	"tcp-connection-close": (msg: TcpConnectionClose) => void;
-	request: (request: TunnelRequest) => void;
-	error: (error: ErrorMessage) => void;
+/** Parse raw WS text message into typed protocol message */
+export function parseMessage(data: string): TunnelMessage {
+	return JSON.parse(data) as TunnelMessage;
 }
 
-export interface ClientToServerEvents {
-	auth: (msg: AuthMessage) => void;
-	"register-tunnel": (msg: RegisterTunnelMessage) => void;
-	"tcp-register": (msg: TcpRegisterMessage) => void;
-	"tcp-data": (msg: TcpDataMessage) => void;
-	"tcp-connection-close": (msg: TcpConnectionClose) => void;
-	response: (response: TunnelResponse) => void;
-}
+/** WS close codes for clean disconnect reasons */
+export const WS_CLOSE_CODES = {
+	NORMAL: 1000,
+	GOING_AWAY: 1001,
+	AUTH_FAILED: 4001,
+	AUTH_TIMEOUT: 4002,
+	RATE_LIMITED: 4003,
+	SUBDOMAIN_TAKEN: 4004,
+} as const;
 
 export enum ErrorCode {
 	AUTH_FAILED = "AUTH_FAILED",
