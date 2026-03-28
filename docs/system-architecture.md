@@ -1,8 +1,8 @@
-# System Architecture
+# System Architecture (v0.3)
 
 ## Overview
 
-Tunelo is a WebSocket relay tunnel proxy. It exposes local services via public HTTPS wildcard subdomains.
+Tunelo is a multi-tenant tunnel proxy with user management, TOTP 2FA, and persistent storage.
 
 ```
                     INTERNET
@@ -15,26 +15,31 @@ Tunelo is a WebSocket relay tunnel proxy. It exposes local services via public H
             +----------+----------+
                        | HTTP (port 3001)
             +----------+----------+
-            |   Tunnel Server     |
-            |   (Node.js)         |
-            |  - WS connections   |
-            |  - Request relay    |
-            |  - Subdomain mgmt  |
-            |  - API key auth     |
+            |   Express.js Server |
+            |   (Tunnel Server v0.3) |
+            |  ┌────────────────┐  |
+            |  │ /api/*         │  │ Auth, keys, usage, admin
+            |  │ /dashboard/*   │  │ Admin SPA (optional)
+            |  │ /*             │  │ Tunnel relay (unchanged)
+            |  └────────────────┘  |
+            |  ┌────────────────┐  |
+            |  │ Middleware     │  │ JWT auth, RBAC, CSRF
+            |  │ Rate Limiter   │  │ Redis/memory/stub
+            |  └────────────────┘  |
+            |  ┌────────────────┐  |
+            |  │ WebSocket      │  │ Tunnel registration
+            |  │ Handler        │  │ Request relay
+            |  └────────────────┘  |
             +----------+----------+
-                       | WebSocket (persistent, outbound from client)
+                   ↓
             +----------+----------+
-            |   Tunnel Client     |
-            |   (CLI tool)        |
-            |  - Connect to server|
-            |  - Receive requests |
-            |  - Proxy to local   |
+            |  MongoDB             |
+            |  - Users             |
+            |  - API Keys          |
+            |  - Usage Logs        |
             +----------+----------+
-                       | HTTP proxy
-            +----------+----------+
-            |   Local Service     |
-            |   localhost:PORT    |
-            +---------------------+
+
+    [Client CLI / Portal SPA] → WebSocket → Tunnel Server → localhost:PORT
 ```
 
 ## Components
@@ -46,37 +51,54 @@ Tunelo is a WebSocket relay tunnel proxy. It exposes local services via public H
 - Proxies to tunnel server on localhost:3001
 - Handles WebSocket upgrade (`Upgrade: websocket`)
 
-### 2. Tunnel Server (`packages/server`)
+### 2. Tunnel Server (`packages/server`) — v0.3 Architecture
 
-HTTP + WebSocket server running on port 3001 (behind nginx).
+Express.js + MongoDB server running on port 3001 (behind nginx).
 
-**Modules:**
+**Route Layers:**
+
+| Layer | Path | Purpose |
+|-------|------|---------|
+| **API** | `/api/auth/*` | POST /signup, /login, /verify-totp, /refresh, /logout |
+| **API** | `/api/user/*` | GET /profile, /keys, /usage; POST /keys; DELETE /keys/:id |
+| **API** | `/api/admin/*` | Admin-only: /users, /tunnels, /stats, /keys (requires ADMIN_EMAILS) |
+| **Dashboard** | `/dashboard/*` | Admin SPA (React, protected by admin role) |
+| **Tunnel Relay** | `/*` | Tunnel request routing (unchanged from v0.1) |
+
+**Core Modules (Tunnel Relay — v0.1 Unchanged):**
 
 | Module | Responsibility |
 |--------|---------------|
-| `server.ts` | Bootstrap HTTP + WS server, health endpoint |
 | `tunnel-manager.ts` | Map<subdomain, TunnelInfo>, register/unregister/lookup |
 | `ws-handler.ts` | Accept WS connections, validate API key, register tunnel |
 | `request-relay.ts` | Serialize HTTP req to WS message, await response, send back |
-| `auth.ts` | Load API key hashes from env, validate incoming keys |
 
-**State:** In-memory `Map<string, TunnelInfo>` — no database needed.
+**New Modules (v0.3 User Management):**
 
-```typescript
-interface TunnelInfo {
-  ws: WebSocket;
-  apiKeyHash: string;
-  subdomain: string;
-  connectedAt: Date;
-  requestCount: number;
-}
-```
+| Module | Responsibility |
+|--------|---------------|
+| `models/user.ts` | Mongoose User schema + methods |
+| `models/api-key.ts` | Mongoose ApiKey schema + validation |
+| `models/usage-log.ts` | Mongoose UsageLog schema + aggregation |
+| `auth/totp-service.ts` | TOTP secret generation + verification (otplib) |
+| `auth/jwt-service.ts` | Access + refresh token management |
+| `api/auth-routes.ts` | Authentication endpoints |
+| `api/user-routes.ts` | User self-service endpoints |
+| `api/admin-routes.ts` | Admin-only endpoints |
+| `middleware/auth.ts` | JWT extraction + verification from httpOnly cookies |
+| `middleware/rbac.ts` | Role-based access control (admin vs user) |
+| `middleware/rate-limiter.ts` | Interface: Redis/memory/stub implementations |
+| `services/usage-tracker.ts` | Request logging + daily snapshot aggregation |
 
-### 3. Tunnel Client (`packages/client`)
+**State:**
+- **In-memory:** `Map<subdomain, TunnelInfo>` for tunnel relay (v0.1 unchanged)
+- **Persistent:** MongoDB for users, API keys, usage logs (new v0.3)
 
-CLI tool distributed via npm. Connects to server via WebSocket.
+### 3. Tunnel Client (`packages/client`) — v0.3 Enhancements
 
-**Modules:**
+CLI tool + embedded React Portal SPA. Distributes via npm.
+
+**CLI Modules (v0.1 — Tunnel Creation):**
 
 | Module | Responsibility |
 |--------|---------------|
@@ -85,7 +107,55 @@ CLI tool distributed via npm. Connects to server via WebSocket.
 | `local-proxy.ts` | Proxy requests to localhost:PORT |
 | `display.ts` | Terminal UI with chalk — status bar, request log |
 
-### 4. Shared Package (`packages/shared`)
+**Portal SPA Modules (v0.3 — New):**
+
+| Module | Responsibility |
+|--------|---------------|
+| `portal/app.tsx` | React entry, routing, context setup |
+| `portal/pages/signup.tsx` | Email/password registration |
+| `portal/pages/login.tsx` | Email/password login |
+| `portal/pages/totp-setup.tsx` | TOTP secret generation + QR code |
+| `portal/pages/keys.tsx` | List, create, revoke API keys |
+| `portal/pages/usage.tsx` | View personal usage charts |
+| `portal/api-client.ts` | Fetch wrapper for API calls |
+
+**Portal Flow:**
+1. User runs `npx tunelo http 3000`
+2. No API key yet → CLI redirects to `http://localhost:4040`
+3. User signs up → sets password → verifies TOTP (Google Authenticator)
+4. Portal generates & displays API key (one-time display)
+5. User returns to CLI → enters key → tunnel starts
+
+### 4. MongoDB Database — v0.3 New
+
+Persistent storage for users, API keys, usage logs.
+
+**Models:**
+
+| Collection | Purpose | Indexes |
+|------------|---------|---------|
+| `users` | User accounts, passwords (bcrypt), TOTP secrets, roles | `email` (unique) |
+| `apikeys` | API keys per user, hashes, labels, expiry | `userId`, `keyHash` (unique) |
+| `usagelogs` | Daily request/bandwidth tracking per key | `keyId`, `userId`, `date` |
+
+**Queries use `.lean()`** for read-only operations (no Document methods, faster).
+
+**Example:**
+```javascript
+// Fast read
+const user = await User.findById(userId).select('email role').lean();
+
+// Aggregate daily usage
+const usage = await UsageLog
+  .aggregate([
+    { $match: { userId: ObjectId(userId), date: { $gte: '2026-03-01' } } },
+    { $group: { _id: '$date', requests: { $sum: '$requestCount' } } },
+    { $sort: { _id: 1 } }
+  ])
+  .exec();
+```
+
+### 5. Shared Package (`packages/shared`)
 
 Types and constants shared between server and client.
 
@@ -93,28 +163,77 @@ Types and constants shared between server and client.
 |--------|----------|
 | `protocol.ts` | WS message types (discriminated unions) |
 | `constants.ts` | Defaults, limits, regex patterns |
-| `errors.ts` | TuneloError class, error codes |
+| `errors.ts` | TuneloError class, error codes (expanded for v0.3) |
 
-## Request Flow
+## Request Flows
 
-1. User runs: `tunelo http 3000 --subdomain myapp`
-2. Client connects WS to `wss://tunnel.inetdev.io.vn/tunnel?key=xxx&subdomain=myapp`
-3. Server validates API key (SHA-256 hash match), registers subdomain `myapp`
-4. Browser hits `https://myapp.tunnel.inetdev.io.vn/api/data`
-5. nginx terminates TLS, extracts subdomain from Host header, proxies to server:3001
-6. Server looks up `myapp` in TunnelManager Map
-7. Server serializes HTTP request as JSON, sends via WS to client
-8. Client receives message, makes `http.request` to `localhost:3000/api/data`
-9. Local service responds
-10. Client serializes response, sends back via WS
-11. Server sends HTTP response to browser
+### 1. User Registration + TOTP Setup (Portal SPA)
+
+1. User: `npx tunelo http 3000` → no API key → redirects to `http://localhost:4040`
+2. Portal: Sign-up form → email + password
+3. Server: `POST /api/auth/signup` → bcrypt password → create User in MongoDB
+4. Server: Return TOTP secret + QR code image
+5. Portal: Display QR code → user scans in Google Authenticator
+6. Portal: User enters 6-digit TOTP code → `POST /api/auth/verify-totp`
+7. Server: Validate code (otplib) → set `user.totpVerified = true` → send JWT
+8. Portal: Display API key (one-time) → user copies to clipboard
+9. CLI: User pastes key → tunnel connects with valid ApiKey
+
+### 2. User Login (v0.3)
+
+1. Portal: User enters email + password
+2. Server: `POST /api/auth/login` → bcrypt compare → validate TOTP requirement
+3. Portal: If TOTP not verified, prompt setup
+4. Portal: User enters TOTP from Google Authenticator
+5. Server: `POST /api/auth/verify-totp` → validate → issue JWT (24h) + refresh token (7d)
+6. Response: Set httpOnly cookies (`accessToken`, `refreshToken`)
+7. Portal: User can now manage keys, view usage
+
+### 3. Tunnel Connection (Unchanged from v0.1)
+
+1. User runs: `tunelo http 3000 --subdomain myapp --key tk_xxxxx`
+2. Client: Connect WS to `wss://tunnel.inetdev.io.vn/tunnel`
+3. Client: Send auth message with API key + subdomain
+4. Server: Look up API key in MongoDB (validate hash + status + expiry)
+5. Server: Extract `userId` from ApiKey → associate tunnel with user
+6. Server: Register subdomain in TunnelManager
+7. Browser: Hit `https://myapp.tunnel.inetdev.io.vn/api/data`
+8. nginx: TLS termination, route to server:3001
+9. Server: Lookup `myapp` tunnel, serialize HTTP request, send via WS
+10. Client: Receive, proxy to `localhost:3000/api/data`
+11. Local service responds
+12. Client: Send response back via WS
+13. Server: Send HTTP response to browser
+14. UsageLog: Increment request count + byte counters for this key
 
 ## WebSocket Protocol
 
 All messages are JSON with discriminated union on `type` field.
 
-### Server to Client
+### v0.3 Auth Message (First Message)
 
+Client **must** send this first; server rejects connection without it.
+
+```typescript
+{
+  type: 'auth',
+  apiKey: string,          // tk_xxxxxxxx (hashed as SHA-256 on server)
+  subdomain: string        // myapp (validated with RFC 1123 regex)
+}
+```
+
+Server responds:
+```typescript
+// Success
+{ type: 'auth_ok', subdomain: string, url: string, userId: string }
+
+// Failure
+{ type: 'error', code: 'TUNELO_AUTH_001', message: 'Invalid API key' }
+```
+
+### Tunnel Relay Messages (v0.1 Unchanged)
+
+**Server to Client:**
 ```typescript
 // Incoming HTTP request
 { type: 'request', id: string, method: string, path: string, headers: Record<string, string>, body: string | null }
@@ -123,23 +242,15 @@ All messages are JSON with discriminated union on `type` field.
 { type: 'ping' }
 ```
 
-### Client to Server
-
+**Client to Server:**
 ```typescript
 // HTTP response
 { type: 'response', id: string, status: number, headers: Record<string, string>, body: string | null }
 
 // Pong (keepalive)
 { type: 'pong' }
-```
 
-### Server to Client (control)
-
-```typescript
-// Auth success
-{ type: 'auth_ok', subdomain: string, url: string }
-
-// Error
+// Error (if relay to local service failed)
 { type: 'error', code: string, message: string }
 ```
 

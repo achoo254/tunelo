@@ -6,6 +6,8 @@
 - Domain: `*.tunnel.inetdev.io.vn` with DNS access
 - Node.js 20+ installed on VPS
 - pnpm installed on VPS
+- MongoDB 5.0+ (v0.3: can run on same VPS or remote host)
+- Email service (for future notifications, optional)
 
 ## DNS Setup
 
@@ -38,6 +40,53 @@ sudo certbot certonly \
 ```
 
 Cert location: `/etc/letsencrypt/live/tunnel.inetdev.io.vn/`
+
+## MongoDB Setup (v0.3+)
+
+### Option A: Local MongoDB (Same VPS)
+
+```bash
+# Install MongoDB Community Edition
+curl -fsSL https://www.mongodb.org/static/pgp/server-5.0.asc | sudo apt-key add -
+echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/5.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-5.0.list
+sudo apt update && sudo apt install -y mongodb-org
+
+# Start and enable
+sudo systemctl start mongod
+sudo systemctl enable mongod
+
+# Verify
+mongo --eval "db.version()"
+
+# Create tunelo database + indexes
+mongo << 'EOF'
+use tunelo
+db.users.createIndex({ "email": 1 }, { unique: true })
+db.apikeys.createIndex({ "userId": 1 })
+db.apikeys.createIndex({ "keyHash": 1 }, { unique: true })
+db.usagelogs.createIndex({ "keyId": 1 })
+db.usagelogs.createIndex({ "date": 1 })
+EOF
+
+# Set connection string in .env
+echo "MONGO_URI=mongodb://localhost/tunelo" >> /opt/tunelo/.env
+```
+
+### Option B: Remote MongoDB (e.g., Atlas)
+
+1. Create cluster at [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
+2. Create database user (username + password)
+3. Whitelist VPS IP in Network Access
+4. Copy connection string
+
+```bash
+# .env example
+MONGO_URI=mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/tunelo?retryWrites=true&w=majority
+```
+
+### Database Initialization
+
+Server will auto-create collections and indexes on startup via Mongoose schemas.
 
 ## nginx Configuration
 
@@ -125,18 +174,42 @@ module.exports = {
     env: {
       NODE_ENV: 'production',
       PORT: 3001,
-      TUNELO_API_KEYS: '<sha256-hash-1>,<sha256-hash-2>'
+
+      // Database (v0.3+)
+      MONGO_URI: 'mongodb://localhost/tunelo',
+
+      // JWT tokens
+      JWT_SECRET: 'your-secret-key-min-32-chars',
+      JWT_REFRESH_SECRET: 'your-refresh-key-min-32-chars',
+
+      // Admin email whitelist (comma-separated)
+      ADMIN_EMAILS: 'admin@example.com,dev@example.com',
+
+      // Tunnel config
+      TUNNEL_DOMAIN: 'tunnel.inetdev.io.vn'
     }
   }]
 };
 ```
 
-**Note:** API key hashes must be SHA-256 hashes of the plaintext keys. Generate with:
+**Important Environment Variables:**
+
+| Var | Type | Example | Notes |
+|-----|------|---------|-------|
+| `MONGO_URI` | String | `mongodb://localhost/tunelo` | v0.3: Required for user/key storage |
+| `JWT_SECRET` | String | 32+ random chars | Used to sign access tokens (24h) |
+| `JWT_REFRESH_SECRET` | String | 32+ random chars | Used to sign refresh tokens (7d) |
+| `ADMIN_EMAILS` | String | `admin@ex.com,dev@ex.com` | Comma-separated emails with admin access |
+| `TUNNEL_DOMAIN` | String | `tunnel.inetdev.io.vn` | Used in URLs + wildcard cert validation |
+| `NODE_ENV` | String | `production` | Controls logging, error details |
+
+**Generate secure secrets:**
 ```bash
-echo -n "your-secret-key" | sha256sum
+# Generate random 32-char string
+openssl rand -base64 24
 ```
 
-## Deploy Steps (MVP)
+## Deploy Steps (v0.3)
 
 ```bash
 # On VPS as deploy user
@@ -146,14 +219,21 @@ cd /opt/tunelo
 # Install dependencies (pnpm workspace)
 pnpm install --frozen-lockfile
 
-# Build all packages (TypeScript compilation)
+# Build all packages (TypeScript + Vite)
 pnpm build
 
-# Generate API key hashes
-echo -n "your-secret-key" | sha256sum
+# (v0.3) Generate secrets
+JWT_SECRET=$(openssl rand -base64 24)
+JWT_REFRESH_SECRET=$(openssl rand -base64 24)
+echo "JWT_SECRET: $JWT_SECRET"
+echo "JWT_REFRESH_SECRET: $JWT_REFRESH_SECRET"
 
-# Edit PM2 config with actual API key hashes
+# (v0.3) Set up MongoDB
+# ... (see MongoDB Setup section above)
+
+# Edit PM2 config with secrets + MongoDB URI
 vim infra/pm2.config.cjs
+# Set: MONGO_URI, JWT_SECRET, JWT_REFRESH_SECRET, ADMIN_EMAILS
 
 # Start tunnel server
 pm2 start infra/pm2.config.cjs
@@ -161,6 +241,8 @@ pm2 start infra/pm2.config.cjs
 # Verify it's running
 pm2 status
 curl http://localhost:3001/health  # Should return 200 OK
+curl http://localhost:3001/api/admin/users \
+  -H "Authorization: Bearer {admin_token}"  # Protected endpoint
 ```
 
 **Verify Deployment:**
@@ -178,11 +260,49 @@ curl -i -N \
 # Should upgrade connection successfully
 ```
 
-## Environment Variables
+## Environment Variables Summary
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PORT` | No | Server port (default: 3001) |
-| `TUNELO_API_KEYS` | Yes | Comma-separated SHA-256 key hashes |
-| `TUNELO_DOMAIN` | No | Base domain (default: tunnel.inetdev.io.vn) |
-| `NODE_ENV` | No | production / development |
+### Core (v0.1+)
+
+| Variable | Required | Type | Default | Notes |
+|----------|----------|------|---------|-------|
+| `PORT` | No | Number | 3001 | Server listening port |
+| `NODE_ENV` | No | String | development | production / development |
+
+### Database & Auth (v0.3+)
+
+| Variable | Required | Type | Example | Notes |
+|----------|----------|------|---------|-------|
+| `MONGO_URI` | Yes | String | `mongodb://localhost/tunelo` | Connection string (local or Atlas) |
+| `JWT_SECRET` | Yes | String | (32+ random chars) | Sign access tokens (24h expiry) |
+| `JWT_REFRESH_SECRET` | Yes | String | (32+ random chars) | Sign refresh tokens (7d expiry) |
+| `ADMIN_EMAILS` | No | String | `admin@ex.com,dev@ex.com` | Comma-separated admin emails |
+| `TUNNEL_DOMAIN` | No | String | `tunnel.inetdev.io.vn` | Base domain for tunnels |
+
+### Optional (Future)
+
+| Variable | Purpose |
+|----------|---------|
+| `REDIS_URI` | Redis connection (v0.3+, for rate limiting) |
+| `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | Email service (future notifications) |
+
+### .env.example Template
+
+```bash
+# Server
+PORT=3001
+NODE_ENV=production
+
+# Database
+MONGO_URI=mongodb://localhost/tunelo
+
+# JWT
+JWT_SECRET=your-32-char-secret-here-generate-new
+JWT_REFRESH_SECRET=your-32-char-secret-here-generate-new
+
+# Admin whitelist
+ADMIN_EMAILS=admin@example.com
+
+# Tunnel config
+TUNNEL_DOMAIN=tunnel.inetdev.io.vn
+```

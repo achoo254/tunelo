@@ -1,6 +1,6 @@
-# Tunelo MVP — Codebase Summary
+# Tunelo Codebase Summary
 
-**Status:** MVP Complete (2026-03-28) | Tests: 19/19 passing
+**Status:** v0.3 (In Development) | v0.1 MVP Complete (2026-03-28) | Tests: 19/19 passing
 
 ## Project Structure
 
@@ -8,8 +8,9 @@
 tunelo/
 ├── packages/
 │   ├── shared/           # Protocol types, error codes, constants
-│   ├── server/           # Tunnel server (HTTP + WebSocket)
-│   ├── client/           # CLI tool (npm: tunelo)
+│   ├── server/           # Tunnel server (Express + WS + MongoDB)
+│   ├── client/           # CLI tool + Client Portal SPA (npm: tunelo)
+│   ├── dashboard/        # Admin Dashboard SPA (planned v0.3)
 │   └── infra/            # nginx, certbot, PM2 configs
 ├── tests/                # E2E test suite
 ├── docs/                 # Documentation
@@ -54,9 +55,36 @@ Format: `TUNELO_{DOMAIN}_{NUMBER}`
 | Server | `SERVER_` | 001-099 | `SERVER_001` Startup failed |
 | Client | `CLIENT_` | 001-099 | `CLIENT_001` Connection failed |
 
-## Server Package (`packages/server`)
+## Server Package (`packages/server`) — v0.3 Planned Enhancements
 
-**Purpose:** HTTP + WebSocket server for tunnel relay.
+**Purpose:** Express.js + MongoDB + WebSocket server for authentication, user management, and tunnel relay.
+
+### New Modules (v0.3)
+
+| Module | Purpose |
+|--------|---------|
+| `models/user.ts` | Mongoose User schema (email, password, TOTP, role, status) |
+| `models/api-key.ts` | Mongoose ApiKey schema (userId, keyHash, label, expiry) |
+| `models/usage-log.ts` | Mongoose UsageLog schema (daily request/bandwidth tracking) |
+| `auth/totp-service.ts` | TOTP setup/verify (otplib, qrcode generation) |
+| `auth/jwt-service.ts` | Token generation/refresh (access 24h, refresh 7d) |
+| `api/auth-routes.ts` | POST /signup, /login, /verify-totp, /refresh, /logout |
+| `api/user-routes.ts` | GET /profile, POST /keys, GET /keys, DELETE /keys/:id |
+| `api/admin-routes.ts` | Admin-only: GET /users, /tunnels, /stats, PATCH /users/:id |
+| `middleware/auth.ts` | JWT extraction + verification from cookies |
+| `middleware/rbac.ts` | Role-based access control (admin vs user) |
+| `middleware/rate-limiter.ts` | Interface-based: Redis + memory + stub implementations |
+| `services/usage-tracker.ts` | Log requests per key, calculate daily snapshots |
+
+### Existing Modules (v0.1 Unchanged)
+
+| Module | Purpose |
+|--------|---------|
+| `tunnel-manager.ts` | In-memory Map<subdomain, TunnelConnection> |
+| `ws-handler.ts` | WebSocket lifecycle (auth, register, relay, cleanup) |
+| `request-relay.ts` | HTTP request serialization + WS relay |
+
+## Server Package (`packages/server`) — v0.1 Architecture
 
 ### Architecture
 
@@ -239,6 +267,47 @@ File: `tests/e2e/`
 - `auth-flow.test.ts` (5 tests) — Auth success/failure, invalid keys
 - `tunnel-flow.test.ts` (5 tests) — Request/response relay, timeouts
 
+## Dashboard Package (`packages/dashboard`) — v0.3 Planned
+
+**Purpose:** React + Vite admin dashboard for user/tunnel/usage management.
+
+### Key Pages
+- **Users:** Table of all users, email, role, status, last login, actions (suspend/activate)
+- **Tunnels:** Active tunnels per user, subdomain, connected time, request rate
+- **Stats:** Usage charts (daily requests, bandwidth), peak times, error rates
+- **Keys:** All API keys across users, usage per key, expiry management
+
+### Tech Stack
+- React 18 + Vite + TypeScript
+- Recharts for metrics visualization
+- React Router for navigation
+- Tailwind CSS for styling
+- API integration with `/api/admin/*` endpoints
+
+## Client Package (`packages/client`) — v0.3 Enhancements
+
+### Existing (v0.1)
+- CLI tool for creating tunnels
+- `tunnel-client.ts`, `local-proxy.ts`, `display.ts`
+
+### New (v0.3)
+**Client Portal SPA** — Embedded React app served at `localhost:4040`
+
+| Module | Purpose |
+|--------|---------|
+| `portal/app.tsx` | React SPA entry point |
+| `portal/pages/signup.tsx` | Email/password registration + TOTP setup |
+| `portal/pages/login.tsx` | Email/password + TOTP verification |
+| `portal/pages/keys.tsx` | List user's API keys, create/revoke, copy to clipboard |
+| `portal/pages/usage.tsx` | Daily usage chart, requests/bandwidth per key |
+| `portal/components/totp-setup.tsx` | QR code display, backup codes |
+| `portal/api-client.ts` | Fetch wrapper for /api/* endpoints |
+
+**How it works:**
+1. `npx tunelo http 3000` starts client
+2. Client prints: `Portal: http://localhost:4040`
+3. User visits in browser → signup → TOTP setup → get API key → back to CLI
+
 ## Infrastructure (`infra/`)
 
 ### nginx Config
@@ -350,12 +419,29 @@ Client auto-reconnect with configurable max attempts. Prevents connection storms
 - **Rate Limiting:** 100 msg/sec per connection
 - **Timeouts:** 30s request relay, 30s WS ping
 
-## Next Steps (v0.2+)
+## v0.3 Roadmap (In Progress)
 
+**Completed (v0.1):**
+✓ WebSocket relay + HTTP tunneling
+✓ API key auth (SHA-256 hashed, env-based)
+✓ Client CLI + chalk display
+✓ 19 unit + E2E tests
+
+**In Progress (v0.3):**
+⏳ MongoDB models (User, ApiKey, UsageLog)
+⏳ Express API (auth, keys, usage endpoints)
+⏳ TOTP 2FA setup + verification
+⏳ Admin Dashboard SPA
+⏳ Client Portal SPA
+⏳ JWT token management (access + refresh)
+⏳ Rate limiter interface design
+⏳ Usage tracking + daily snapshots
+
+**Next (v0.4+):**
 - WebSocket pass-through (tunnel WS traffic)
 - Binary streaming (replace base64 with binary frames)
 - Standalone binary distribution (pkg/nexe)
-- Request inspection dashboard
-- Per-key rate limiting
+- Request inspection/replay
 - Custom domain support
-- Multi-server scaling (Redis + load balancer)
+- Raw TCP tunneling
+- Multi-server scaling (Redis + load balancer, planned v0.5)
