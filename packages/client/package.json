@@ -1,17 +1,42 @@
 {
-	"name": "@tunelo/client",
-	"version": "0.1.0",
+	"name": "@achoo254/tunelo",
+	"version": "0.2.0",
 	"type": "module",
+	"description": "Self-hosted ngrok alternative — expose local services via public HTTPS tunnels",
 	"main": "dist/cli.js",
 	"bin": {
 		"tunelo": "dist/cli.js"
 	},
+	"files": [
+		"dist/cli.js",
+		"dist/cli.js.map"
+	],
 	"scripts": {
 		"build": "tsc",
-		"dev": "tsx watch src/cli.ts"
+		"build:bundle": "tsx ../../scripts/build-client.ts",
+		"dev": "tsx watch src/cli.ts",
+		"prepublishOnly": "pnpm run build:bundle"
+	},
+	"keywords": [
+		"tunnel",
+		"ngrok",
+		"localhost",
+		"websocket",
+		"proxy",
+		"https",
+		"tcp"
+	],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/achoo254/tunelo.git",
+		"directory": "packages/client"
+	},
+	"homepage": "https://github.com/achoo254/tunelo",
+	"license": "MIT",
+	"engines": {
+		"node": ">=20"
 	},
 	"dependencies": {
-		"@tunelo/shared": "workspace:*",
 		"chalk": "^5.3.0",
 		"commander": "^12.0.0",
 		"pino": "^9.0.0",
@@ -20,5 +45,8 @@
 	},
 	"devDependencies": {
 		"@types/ws": "^8.5.0"
+	},
+	"publishConfig": {
+		"access": "public"
 	}
 }

@@ -5,8 +5,8 @@
 	"workspaces": ["packages/*"],
 	"scripts": {
 		"dev:server": "pnpm --filter @tunelo/server dev",
-		"dev:client": "pnpm --filter @tunelo/client dev",
-		"build": "pnpm --filter @tunelo/shared build && pnpm --filter @tunelo/server build && pnpm --filter @tunelo/client build",
+		"dev:client": "pnpm --filter @achoo254/tunelo dev",
+		"build": "pnpm --filter @tunelo/shared build && pnpm --filter @tunelo/server build && pnpm --filter @achoo254/tunelo build",
 		"build:server": "tsx scripts/build-server.ts",
 		"clean": "rm -rf packages/*/dist dist",
 		"test": "vitest run",

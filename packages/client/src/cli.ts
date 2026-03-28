@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import type { RegisterTunnelResult } from "@tunelo/shared";
 import { program } from "commander";
 import { registerTcpCommand } from "./cli-tcp-command.js";
