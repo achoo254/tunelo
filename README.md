@@ -1,34 +1,34 @@
 # Tunelo
 
-Tiếng Việt | **[English](./README.en.md)**
+**Tiếng Việt** | [English](./README.en.md)
 
-Self-hosted tunnel proxy. Expose local services via public HTTPS with wildcard subdomains. Your infrastructure, your rules — no cloud vendor lock-in, no artificial limits.
+Tunnel proxy tự host. Mở cổng dịch vụ local ra internet qua HTTPS với wildcard subdomain. Hạ tầng của bạn, luật chơi của bạn — không phụ thuộc cloud vendor, không giới hạn nhân tạo.
 
 ```bash
 npx tunelo http 3000
 # => https://myapp.tunnel.inetdev.io.vn
 ```
 
-## Why Tunelo?
+## Tại sao chọn Tunelo?
 
-ngrok is powerful until you hit free tier limits. Tunelo is the self-hosted alternative — no rate limits, unlimited tunnels, open source.
+ngrok rất mạnh cho đến khi bạn chạm giới hạn gói miễn phí. Tunelo là giải pháp tự host thay thế — không giới hạn tốc độ, không giới hạn số tunnel, mã nguồn mở.
 
-| Feature | **Tunelo** | **ngrok Free** |
-|---------|----------|---|
-| Cost | Free (your VPS) | $0 |
-| Endpoints | Unlimited | 3 max |
-| Requests/month | Unlimited | 20k |
-| Custom subdomains | Yes | No |
-| Self-hosted | Yes | No |
-| Open source | Yes (MIT) | No |
-| Data routing | Direct (your VPS) | Via ngrok cloud |
+| Tính năng | **Tunelo** | **ngrok Free** |
+|-----------|----------|---|
+| Chi phí | Miễn phí (VPS của bạn) | $0 |
+| Số endpoint | Không giới hạn | Tối đa 3 |
+| Request/tháng | Không giới hạn | 20k |
+| Subdomain tùy chỉnh | Có | Không |
+| Tự host | Có | Không |
+| Mã nguồn mở | Có (MIT) | Không |
+| Định tuyến dữ liệu | Trực tiếp (VPS của bạn) | Qua cloud ngrok |
 
-## Architecture
+## Kiến trúc
 
 ```
 Browser → nginx (TLS) → Tunnel Server (Express + MongoDB)
                            ↓
-                      API (auth, keys, usage)
+                      API (xác thực, key, thống kê)
                            ↓
                       WebSocket Relay
                            ↓
@@ -39,100 +39,100 @@ Client CLI → localhost:PORT
 
 - **Runtime:** Node.js 20+, TypeScript strict, ESM
 - **Server:** Express.js + raw WebSocket relay
-- **Database:** MongoDB + Mongoose (.lean() for performance)
-- **Auth:** TOTP 2FA (Google Authenticator), JWT tokens (24h access, 7d refresh)
-- **Encryption:** bcrypt passwords, SHA-256 API keys
-- **Portals:** Admin Dashboard SPA + Client Portal SPA (both React + Vite)
-- **Testing:** vitest + E2E
+- **Database:** MongoDB + Mongoose (.lean() để tối ưu hiệu năng)
+- **Xác thực:** TOTP 2FA (Google Authenticator), JWT token (24h access, 7d refresh)
+- **Mã hóa:** bcrypt cho mật khẩu, SHA-256 cho API key
+- **Giao diện:** Admin Dashboard SPA + Client Portal SPA (cả hai dùng React + Vite)
+- **Test:** vitest + E2E
 - **Lint:** Biome
-- **Deploy:** nginx + PM2 + MongoDB
+- **Triển khai:** nginx + PM2 + MongoDB
 
-## Getting Started
+## Bắt đầu
 
-### Install dependencies
+### Cài đặt
 ```bash
 git clone <repo> && cd tunelo
 pnpm install && pnpm build
 ```
 
-### Development
+### Phát triển
 ```bash
-pnpm dev:server    # Server with tsx --watch
+pnpm dev:server    # Server với tsx --watch
 pnpm dev:client    # Client CLI
-pnpm test          # Run tests
-pnpm lint:fix      # Auto-fix linting
+pnpm test          # Chạy test
+pnpm lint:fix      # Tự động sửa lỗi lint
 ```
 
-## Monorepo Structure
+## Cấu trúc Monorepo
 
 ```
 tunelo/
 ├── packages/
-│   ├── shared/           # Shared types, constants, error codes
+│   ├── shared/           # Type, hằng số, mã lỗi dùng chung
 │   ├── server/           # Tunnel server (Express + WS relay + MongoDB)
 │   ├── client/           # CLI tool + portal SPA
 │   ├── dashboard/        # Admin Dashboard SPA (React + Vite)
-├── infra/                # nginx, certbot, PM2 configs
-├── docs/                 # Documentation
-└── plans/                # Implementation plans
+├── infra/                # Cấu hình nginx, certbot, PM2
+├── docs/                 # Tài liệu
+└── plans/                # Kế hoạch triển khai
 ```
 
-## Key Features (v0.3)
+## Tính năng chính (v0.3)
 
-✅ **User Management:** Sign up, login with TOTP 2FA, manage API keys
-✅ **Admin Dashboard:** See all users, tunnels, usage metrics, suspend accounts
-✅ **Client Portal:** Embedded React SPA at localhost:4040, self-service key management
-✅ **MongoDB:** Persistent user/key/usage storage
-✅ **JWT Auth:** httpOnly cookies + CSRF protection, 24h access + 7d refresh tokens
-✅ **Usage Tracking:** Per-key request counts, bandwidth, daily snapshots
-✅ **Rate Limiting:** Redis-backed (swappable interface)
+✅ **Quản lý người dùng:** Đăng ký, đăng nhập với TOTP 2FA, quản lý API key
+✅ **Admin Dashboard:** Xem tất cả người dùng, tunnel, thống kê sử dụng, tạm khóa tài khoản
+✅ **Client Portal:** React SPA nhúng tại localhost:4040, tự quản lý key
+✅ **MongoDB:** Lưu trữ bền vững người dùng/key/thống kê sử dụng
+✅ **JWT Auth:** httpOnly cookie + CSRF protection, token access 24h + refresh 7 ngày
+✅ **Theo dõi sử dụng:** Đếm request, bandwidth theo từng key, snapshot hàng ngày
+✅ **Giới hạn tốc độ:** Dùng Redis (interface có thể thay thế)
 
-## Deployment
+## Triển khai
 
-See `docs/deployment-guide.md` for full setup. Quick summary:
+Xem `docs/deployment-guide.md` để biết chi tiết. Tóm tắt nhanh:
 
 1. DNS: `*.tunnel.inetdev.io.vn → VPS_IP`
-2. Cert: Wildcard SSL via Let's Encrypt
-3. MongoDB: Running on localhost or remote
-4. Env vars: `MONGO_URI`, `JWT_SECRET`, `ADMIN_EMAILS`, API keys
-5. Build & deploy via PM2
+2. Chứng chỉ: Wildcard SSL qua Let's Encrypt
+3. MongoDB: Chạy trên localhost hoặc remote
+4. Biến môi trường: `MONGO_URI`, `JWT_SECRET`, `ADMIN_EMAILS`, API key
+5. Build và triển khai qua PM2
 
-## Environment Variables
+## Biến môi trường
 
 ```bash
-# Core
+# Cốt lõi
 MONGO_URI=mongodb://localhost/tunelo
 JWT_SECRET=your-secret-key
 JWT_REFRESH_SECRET=your-refresh-secret
 
-# Admin whitelist (comma-separated emails)
+# Danh sách admin (phân tách bằng dấu phẩy)
 ADMIN_EMAILS=admin@example.com,dev@example.com
 
 # Server
 PORT=3001
 NODE_ENV=production
 
-# Tunnel config
+# Cấu hình tunnel
 TUNNEL_DOMAIN=tunnel.inetdev.io.vn
 TUNNEL_PORT=3001
 ```
 
-## API Examples
+## Ví dụ API
 
-### Sign up
+### Đăng ký
 ```bash
 curl -X POST http://localhost:3001/api/auth/signup \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"secret"}'
 ```
 
-### Generate TOTP secret
+### Tạo TOTP secret
 ```bash
 curl -X POST http://localhost:3001/api/auth/totp-setup \
   -H "Authorization: Bearer {accessToken}"
 ```
 
-### Create API key
+### Tạo API key
 ```bash
 curl -X POST http://localhost:3001/api/keys \
   -H "Authorization: Bearer {accessToken}" \
@@ -140,24 +140,24 @@ curl -X POST http://localhost:3001/api/keys \
   -d '{"label":"My Device"}'
 ```
 
-## Security
+## Bảo mật
 
-- TOTP 2FA mandatory for all users
-- API keys stored as SHA-256 hashes
-- Passwords hashed with bcrypt
-- Hop-by-hop headers stripped from relay
-- httpOnly cookies + CSRF tokens
-- Rate limiting: 100 msg/s per WS connection
-- Max body: 10 MB
-- Request timeout: 30s
+- TOTP 2FA bắt buộc cho tất cả người dùng
+- API key lưu dạng SHA-256 hash
+- Mật khẩu hash bằng bcrypt
+- Loại bỏ hop-by-hop header khi relay
+- httpOnly cookie + CSRF token
+- Giới hạn tốc độ: 100 msg/s mỗi kết nối WS
+- Kích thước body tối đa: 10 MB
+- Timeout request: 30 giây
 
-## Roadmap
+## Lộ trình phát triển
 
 - **v0.2:** WebSocket pass-through, binary streaming, standalone binary
-- **v0.3 (current):** MongoDB, user mgmt, TOTP 2FA, dual portals
-- **v0.4:** Custom domains, TCP raw tunnels, request replay
-- **v0.5:** Multi-server scaling, Redis, load balancing
+- **v0.3 (hiện tại):** MongoDB, quản lý người dùng, TOTP 2FA, hai portal
+- **v0.4:** Custom domain, TCP raw tunnel, request replay
+- **v0.5:** Mở rộng multi-server, Redis, load balancing
 
-## License
+## Giấy phép
 
 MIT
