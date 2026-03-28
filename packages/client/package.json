@@ -1,0 +1,24 @@
+{
+	"name": "@tunelo/client",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "dist/cli.js",
+	"bin": {
+		"tunelo": "dist/cli.js"
+	},
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsx watch src/cli.ts"
+	},
+	"dependencies": {
+		"@tunelo/shared": "workspace:*",
+		"chalk": "^5.3.0",
+		"commander": "^12.0.0",
+		"pino": "^9.0.0",
+		"socket.io-client": "^4.8.3",
+		"ws": "^8.16.0"
+	},
+	"devDependencies": {
+		"@types/ws": "^8.5.0"
+	}
+}

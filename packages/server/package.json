@@ -1,0 +1,21 @@
+{
+	"name": "@tunelo/server",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "dist/server.js",
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsx watch src/server.ts",
+		"start": "node dist/server.js"
+	},
+	"dependencies": {
+		"@tunelo/shared": "workspace:*",
+		"nanoid": "^5.0.0",
+		"pino": "^9.0.0",
+		"socket.io": "^4.8.3",
+		"ws": "^8.16.0"
+	},
+	"devDependencies": {
+		"@types/ws": "^8.5.0"
+	}
+}

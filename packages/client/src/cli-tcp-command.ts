@@ -1,0 +1,88 @@
+/** CLI handler for `tunelo tcp <port>` command */
+
+import type { TcpRegisterResult } from "@tunelo/shared";
+import type { Command } from "commander";
+import { loadConfig } from "./config.js";
+import type { Display } from "./display.js";
+import { TcpProxy } from "./tcp-proxy.js";
+import { TunnelClient } from "./tunnel-client.js";
+
+export function registerTcpCommand(program: Command, display: Display): void {
+	program
+		.command("tcp <port>")
+		.description("Create TCP tunnel to local port")
+		.option("-k, --key <apikey>", "API key for authentication")
+		.option("--server <url>", "Tunnel server URL")
+		.option("--remote-port <port>", "Request specific remote port")
+		.action(
+			async (
+				portStr: string,
+				options: { key?: string; server?: string; remotePort?: string },
+			) => {
+				const port = Number(portStr);
+				if (Number.isNaN(port) || port < 1 || port > 65535) {
+					display.showError("Invalid port number");
+					process.exit(1);
+				}
+
+				const config = loadConfig();
+				const apiKey = options.key ?? process.env.TUNELO_KEY ?? config.key;
+				const serverUrl =
+					options.server ??
+					process.env.TUNELO_SERVER ??
+					config.server ??
+					"wss://tunnel.inetdev.io.vn";
+
+				if (!apiKey) {
+					display.showError("API key required.");
+					process.exit(1);
+				}
+
+				display.showBanner("0.1.0");
+				display.showConnecting(serverUrl);
+
+				const client = new TunnelClient({ serverUrl, apiKey, localPort: port });
+
+				client.on("connected", () => {
+					const remotePort = options.remotePort
+						? Number(options.remotePort)
+						: undefined;
+					client.registerTcp(port, remotePort);
+				});
+
+				client.on("tcp-registered", (result: TcpRegisterResult) => {
+					display.showTcpTunnel(result.url, port);
+					const socket = client.getSocket();
+					if (socket) {
+						new TcpProxy(socket, port);
+					}
+				});
+
+				client.on("tcp-register-error", (result: TcpRegisterResult) => {
+					display.showError(`TCP tunnel failed: ${result.error}`);
+				});
+
+				client.on("disconnected", () => display.showDisconnected());
+				client.on(
+					"reconnecting",
+					(info: { attempt: number; delay: number }) => {
+						display.showReconnecting(info.attempt, info.delay);
+					},
+				);
+				client.on("error", (err: Error) => display.showError(err.message));
+
+				try {
+					await client.connect();
+				} catch (err) {
+					display.showError((err as Error).message);
+					process.exit(1);
+				}
+
+				process.on("SIGINT", () => {
+					client.disconnect();
+					display.showStats();
+					process.exit(0);
+				});
+			},
+		);
+}
