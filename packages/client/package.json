@@ -7,12 +7,10 @@
 	"bin": {
 		"tunelo": "dist/cli.js"
 	},
-	"files": [
-		"dist/cli.js",
-		"dist/cli.js.map"
-	],
+	"files": ["dist/cli.js", "dist/cli.js.map"],
 	"scripts": {
 		"build": "tsc",
+		"build:portal": "vite build --config vite.config.portal.ts",
 		"build:bundle": "tsx ../../scripts/build-client.ts",
 		"dev": "tsx watch src/cli.ts",
 		"prepublishOnly": "pnpm run build:bundle"
@@ -44,7 +42,17 @@
 		"ws": "^8.16.0"
 	},
 	"devDependencies": {
-		"@types/ws": "^8.5.0"
+		"@tailwindcss/vite": "^4.1.3",
+		"@types/react": "^18.3.1",
+		"@types/react-dom": "^18.3.1",
+		"@types/ws": "^8.5.0",
+		"@vitejs/plugin-react": "^4.3.4",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
+		"react-router-dom": "^6.28.0",
+		"recharts": "^2.15.0",
+		"tailwindcss": "^4.1.3",
+		"vite": "^6.2.0"
 	},
 	"publishConfig": {
 		"access": "public"

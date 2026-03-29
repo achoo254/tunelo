@@ -61,6 +61,12 @@ export class Display {
 		);
 	}
 
+	showPortal(port: number): void {
+		console.log(
+			chalk.green("  Portal:    ") + chalk.cyan(`http://localhost:${port}`),
+		);
+	}
+
 	showTunnelRegistered(
 		subdomain: string,
 		url: string,

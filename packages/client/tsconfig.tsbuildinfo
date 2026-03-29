@@ -1,0 +1,1 @@
+{"root":["./src/cli-tcp-command.ts","./src/cli.ts","./src/config.ts","./src/display.ts","./src/inspector-integration.ts","./src/inspector-server.ts","./src/inspector-ui.ts","./src/local-proxy.ts","./src/request-store.ts","./src/tcp-proxy.ts","./src/tunnel-client.ts","./src/tunnel-config-parser.ts"],"errors":true,"version":"5.9.3"}

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import {
 	type AuthMessage,
@@ -13,7 +13,7 @@ import {
 } from "@tunelo/shared";
 import { customAlphabet } from "nanoid";
 import { type WebSocket, WebSocketServer } from "ws";
-import { validateApiKey } from "./auth.js";
+import type { KeyInfo, KeyStore } from "./key-store/key-store-types.js";
 import { createLogger } from "./logger.js";
 import {
 	type TcpConnectionState,
@@ -32,11 +32,16 @@ const generateSubdomain = customAlphabet(
 );
 const logger = createLogger("tunelo-ws");
 
+function hashKey(key: string): string {
+	return createHash("sha256").update(key).digest("hex");
+}
+
 /** Per-connection state attached after upgrade */
 interface ConnectionState {
 	id: string;
 	authenticated: boolean;
 	subdomain: string;
+	keyInfo: KeyInfo | null;
 	messageCount: number;
 	rateLimitInterval: ReturnType<typeof setInterval>;
 	authTimer: ReturnType<typeof setTimeout>;
@@ -45,7 +50,7 @@ interface ConnectionState {
 	alive: boolean;
 }
 
-export function attachWsHandler(server: http.Server): void {
+export function attachWsHandler(server: http.Server, keyStore: KeyStore): void {
 	const wss = new WebSocketServer({
 		noServer: true,
 		maxPayload: DEFAULTS.MAX_BODY_SIZE,
@@ -67,6 +72,7 @@ export function attachWsHandler(server: http.Server): void {
 			id: randomUUID(),
 			authenticated: false,
 			subdomain: "",
+			keyInfo: null,
 			messageCount: 0,
 			rateLimitInterval: setInterval(() => {
 				state.messageCount = 0;
@@ -119,7 +125,7 @@ export function attachWsHandler(server: http.Server): void {
 
 			switch (msg.type) {
 				case "auth":
-					handleAuth(ws, state, msg);
+					handleAuth(ws, state, msg, keyStore);
 					break;
 				case "register-tunnel":
 					handleRegisterTunnel(ws, state, msg);
@@ -141,7 +147,6 @@ export function attachWsHandler(server: http.Server): void {
 					handleTcpConnectionClose(msg, state.tcpState);
 					break;
 				case "pong":
-					// Application-level pong — no-op, we use native WS pong
 					break;
 				default:
 					break;
@@ -162,15 +167,19 @@ export function attachWsHandler(server: http.Server): void {
 	});
 }
 
-function handleAuth(
+async function handleAuth(
 	ws: WebSocket,
 	state: ConnectionState,
 	msg: AuthMessage,
-): void {
+	keyStore: KeyStore,
+): Promise<void> {
 	if (state.authenticated) return;
 	clearTimeout(state.authTimer);
 
-	if (!validateApiKey(msg.key)) {
+	const keyHash = hashKey(msg.key);
+	const keyInfo = await keyStore.validate(keyHash);
+
+	if (!keyInfo) {
 		safeSend(ws, {
 			type: "auth-result",
 			success: false,
@@ -179,6 +188,20 @@ function handleAuth(
 			error: "Invalid API key",
 		});
 		ws.close(WS_CLOSE_CODES.AUTH_FAILED, "Invalid API key");
+		return;
+	}
+
+	// Enforce maxTunnelsPerKey
+	const currentCount = tunnelManager.countByKeyHash(keyHash);
+	if (currentCount >= keyInfo.maxTunnels) {
+		safeSend(ws, {
+			type: "auth-result",
+			success: false,
+			subdomain: "",
+			url: "",
+			error: "Max tunnels per key exceeded",
+		});
+		ws.close(WS_CLOSE_CODES.AUTH_FAILED, "Max tunnels exceeded");
 		return;
 	}
 
@@ -197,7 +220,15 @@ function handleAuth(
 	}
 
 	if (
-		!tunnelManager.register(requestedSubdomain, ws, state.id, msg.key, msg.auth)
+		!tunnelManager.register(
+			requestedSubdomain,
+			ws,
+			state.id,
+			keyHash,
+			keyInfo.userId,
+			keyInfo.keyId,
+			msg.auth,
+		)
 	) {
 		safeSend(ws, {
 			type: "auth-result",
@@ -212,6 +243,7 @@ function handleAuth(
 
 	state.authenticated = true;
 	state.subdomain = requestedSubdomain;
+	state.keyInfo = keyInfo;
 	const url = buildTunnelUrl(requestedSubdomain);
 
 	safeSend(ws, {
@@ -228,7 +260,7 @@ function handleRegisterTunnel(
 	state: ConnectionState,
 	msg: RegisterTunnelMessage,
 ): void {
-	if (!state.authenticated) return;
+	if (!state.authenticated || !state.keyInfo) return;
 
 	const requestedSubdomain = msg.subdomain || generateSubdomain();
 
@@ -244,9 +276,30 @@ function handleRegisterTunnel(
 		return;
 	}
 
-	const apiKey = tunnelManager.get(state.subdomain)?.apiKey ?? "";
+	// Enforce maxTunnelsPerKey
+	const currentCount = tunnelManager.countByKeyHash(state.keyInfo.keyHash);
+	if (currentCount >= state.keyInfo.maxTunnels) {
+		safeSend(ws, {
+			type: "register-tunnel-result",
+			success: false,
+			subdomain: requestedSubdomain,
+			localPort: msg.localPort,
+			url: "",
+			error: "Max tunnels per key exceeded",
+		});
+		return;
+	}
+
 	if (
-		!tunnelManager.register(requestedSubdomain, ws, state.id, apiKey, msg.auth)
+		!tunnelManager.register(
+			requestedSubdomain,
+			ws,
+			state.id,
+			state.keyInfo.keyHash,
+			state.keyInfo.userId,
+			state.keyInfo.keyId,
+			msg.auth,
+		)
 	) {
 		safeSend(ws, {
 			type: "register-tunnel-result",

@@ -7,6 +7,7 @@ import {
 	generateRequestId,
 } from "@tunelo/shared";
 import { createLogger } from "./logger.js";
+import { usageTracker } from "./services/usage-tracker.js";
 import { tunnelManager } from "./tunnel-manager.js";
 
 const logger = createLogger("tunelo-relay");
@@ -94,7 +95,6 @@ export function createRelayHandler(): http.RequestListener {
 			tunnelManager
 				.sendRequest(subdomain, tunnelReq)
 				.then((tunnelRes) => {
-					// Write response back
 					const responseBody = tunnelRes.body
 						? Buffer.from(tunnelRes.body, "base64")
 						: null;
@@ -106,6 +106,14 @@ export function createRelayHandler(): http.RequestListener {
 						res.end(responseBody);
 					} else {
 						res.end();
+					}
+
+					// Fire-and-forget usage tracking
+					const tunnel = tunnelManager.get(subdomain);
+					if (tunnel) {
+						const bytesIn = body ? Buffer.byteLength(body, "base64") : 0;
+						const bytesOut = responseBody ? responseBody.length : 0;
+						usageTracker.record(tunnel.keyId, tunnel.userId, bytesIn, bytesOut);
 					}
 				})
 				.catch((err) => {

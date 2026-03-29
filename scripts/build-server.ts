@@ -10,14 +10,13 @@ await build({
 	bundle: true,
 	platform: "node",
 	target: "node20",
-	format: "cjs",
-	outfile: resolve(root, "dist/server.cjs"),
+	format: "esm",
+	outfile: resolve(root, "dist/server.mjs"),
 	sourcemap: true,
 	minify: false,
-	// Bundle all deps into single file — no node_modules needed on server
 	banner: {
 		js: "// Tunelo Server — bundled with esbuild",
 	},
 });
 
-console.log("Built dist/server.cjs");
+console.log("Built dist/server.mjs");

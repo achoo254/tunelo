@@ -17,7 +17,12 @@ export interface TunnelConnection {
 	socket: WebSocket;
 	/** Unique connection ID for tracking across reconnects */
 	connectionId: string;
-	apiKey: string;
+	/** SHA-256 hash of the API key used to authenticate */
+	apiKeyHash: string;
+	/** User ID from KeyStore (MongoDB ObjectId or dev placeholder) */
+	userId: string;
+	/** API key ID from KeyStore */
+	keyId: string;
 	subdomain: string;
 	connectedAt: Date;
 	pendingRequests: Map<string, PendingRequest>;
@@ -36,7 +41,9 @@ class TunnelManager {
 		subdomain: string,
 		socket: WebSocket,
 		connectionId: string,
-		apiKey: string,
+		apiKeyHash: string,
+		userId: string,
+		keyId: string,
 		auth?: string,
 	): boolean {
 		// If tunnel exists with a different socket, reject (subdomain taken)
@@ -63,7 +70,9 @@ class TunnelManager {
 		this.tunnels.set(subdomain, {
 			socket,
 			connectionId,
-			apiKey,
+			apiKeyHash,
+			userId,
+			keyId,
 			subdomain,
 			connectedAt: new Date(),
 			pendingRequests,
@@ -201,6 +210,48 @@ class TunnelManager {
 	checkAuth(subdomain: string, authHeader: string | undefined): boolean {
 		const tunnel = this.tunnels.get(subdomain);
 		return checkBasicAuth(tunnel?.authHash, authHeader);
+	}
+
+	/** Count active tunnels using a specific API key hash */
+	countByKeyHash(keyHash: string): number {
+		let count = 0;
+		for (const tunnel of this.tunnels.values()) {
+			if (tunnel.apiKeyHash === keyHash) count++;
+		}
+		return count;
+	}
+
+	/** Count active tunnels for a specific user */
+	countByUserId(userId: string): number {
+		let count = 0;
+		for (const tunnel of this.tunnels.values()) {
+			if (tunnel.userId === userId) count++;
+		}
+		return count;
+	}
+
+	/** Disconnect and unregister all tunnels using a specific API key hash */
+	disconnectByKeyHash(keyHash: string): void {
+		const subdomains: string[] = [];
+		for (const [subdomain, tunnel] of this.tunnels) {
+			if (tunnel.apiKeyHash === keyHash) subdomains.push(subdomain);
+		}
+		for (const subdomain of subdomains) {
+			const tunnel = this.tunnels.get(subdomain);
+			if (tunnel) tunnel.socket.close();
+			this.unregister(subdomain);
+		}
+		if (subdomains.length > 0) {
+			logger.info(
+				{ keyHash: keyHash.slice(0, 8), count: subdomains.length },
+				"Disconnected tunnels by key hash",
+			);
+		}
+	}
+
+	/** Get all active tunnel connections (for admin API) */
+	getAllConnections(): TunnelConnection[] {
+		return [...this.tunnels.values()];
 	}
 
 	getStats(): { activeTunnels: number; subdomains: string[] } {
