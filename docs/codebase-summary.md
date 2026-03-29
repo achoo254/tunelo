@@ -1,6 +1,6 @@
 # Tunelo Codebase Summary
 
-**Status:** v0.3 (In Development) | v0.1 MVP Complete (2026-03-28) | Tests: 19/19 passing
+**Status:** v0.3.1 (2026-03-29) | Device Code Auth Flow | MongoDB User & Key Management | Tests: 19/19 passing
 
 ## Project Structure
 
@@ -55,26 +55,81 @@ Format: `TUNELO_{DOMAIN}_{NUMBER}`
 | Server | `SERVER_` | 001-099 | `SERVER_001` Startup failed |
 | Client | `CLIENT_` | 001-099 | `CLIENT_001` Connection failed |
 
-## Server Package (`packages/server`) — v0.3 Planned Enhancements
+## Server Package (`packages/server`) — v0.3 Complete Implementation
 
 **Purpose:** Express.js + MongoDB + WebSocket server for authentication, user management, and tunnel relay.
 
-### New Modules (v0.3)
+### New Modules (v0.3 — Implemented)
 
+#### Database Models
 | Module | Purpose |
 |--------|---------|
-| `models/user.ts` | Mongoose User schema (email, password, TOTP, role, status) |
-| `models/api-key.ts` | Mongoose ApiKey schema (userId, keyHash, label, expiry) |
-| `models/usage-log.ts` | Mongoose UsageLog schema (daily request/bandwidth tracking) |
-| `auth/totp-service.ts` | TOTP setup/verify (otplib, qrcode generation) |
-| `auth/jwt-service.ts` | Token generation/refresh (access 24h, refresh 7d) |
+| `db/models/user-model.ts` | Mongoose User schema (email, passwordHash, role, TOTP secret/verified) |
+| `db/models/api-key-model.ts` | Mongoose ApiKey schema (userId, keyHash, keyPrefix, label, expiry, status) |
+| `db/models/device-code-model.ts` | Mongoose DeviceCode schema (deviceCode, userCode, approval status, API key storage, 5min TTL) |
+| `db/models/usage-log-model.ts` | Mongoose UsageLog schema (daily request/bandwidth tracking per key) |
+| `db/connection-manager.ts` | MongoDB connection + lifecycle (initialize, shutdown) |
+
+#### Services
+| Module | Purpose |
+|--------|---------|
+| `services/totp-service.ts` | Generate/verify TOTP secrets (otplib), QR code generation |
+| `services/auth-service.ts` | User registration, password validation (bcrypt), TOTP verification |
+| `services/device-auth-service.ts` | Create device codes, poll approval status, approve & generate keys (atomic ops) |
+| `services/key-service.ts` | Generate/validate/revoke API keys (SHA-256 hashing) |
+| `services/admin-service.ts` | Admin operations (list users, tunnels, stats, bulk key operations) |
+| `services/usage-tracker.ts` | Log requests per key, aggregate daily snapshots |
+
+#### API Routes
+| Module | Purpose |
+|--------|---------|
 | `api/auth-routes.ts` | POST /signup, /login, /verify-totp, /refresh, /logout |
-| `api/user-routes.ts` | GET /profile, POST /keys, GET /keys, DELETE /keys/:id |
-| `api/admin-routes.ts` | Admin-only: GET /users, /tunnels, /stats, PATCH /users/:id |
-| `middleware/auth.ts` | JWT extraction + verification from cookies |
-| `middleware/rbac.ts` | Role-based access control (admin vs user) |
-| `middleware/rate-limiter.ts` | Interface-based: Redis + memory + stub implementations |
-| `services/usage-tracker.ts` | Log requests per key, calculate daily snapshots |
+| `api/device-auth-routes.ts` | POST /device (create), /device/poll (CLI), /device/approve (Portal) |
+| `api/profile-routes.ts` | GET /profile, PATCH /profile (email, password update) |
+| `api/key-routes.ts` | GET /keys, POST /keys, DELETE /keys/:id, PATCH /keys/:id |
+| `api/usage-routes.ts` | GET /usage (daily summary), /usage/detailed (per-key breakdown) |
+| `api/admin-routes.ts` | GET /users, /users/:id, /tunnels, /stats, /keys, PATCH /users/:id |
+| `api/create-api-router.ts` | Express router factory with middleware stack |
+
+#### Middleware
+| Module | Purpose |
+|--------|---------|
+| `api/middleware/cookie-auth.ts` | JWT extraction + verification from httpOnly cookies |
+| `api/middleware/admin-guard.ts` | Enforce admin role (403 if user) |
+| `api/middleware/csrf-protection.ts` | CSRF token validation (double-submit pattern) |
+| `api/middleware/rate-limiter.ts` | Per-IP rate limiting with configurable limits |
+| `api/middleware/validate-body.ts` | Zod schema validation with structured error responses |
+| `api/middleware/error-handler.ts` | Centralized error handler (TuneloError → JSON) |
+
+#### Validation Schemas
+| Module | Purpose |
+|--------|---------|
+| `api/schemas/auth-schemas.ts` | Zod schemas for signup, login, verify-totp, refresh |
+| `api/schemas/device-auth-schemas.ts` | Zod schemas for device code poll (deviceCode) and approve (userCode) |
+| `api/schemas/key-schemas.ts` | Zod schemas for key creation (label, optional expiry) |
+| `api/schemas/usage-schemas.ts` | Zod schemas for usage queries (date range, key filters) |
+| `api/schemas/admin-schemas.ts` | Zod schemas for admin operations (user updates, bulk actions) |
+
+#### Key Store (Pluggable)
+| Module | Purpose |
+|--------|---------|
+| `key-store/key-store-types.ts` | KeyStore interface (injectable: validate, store, revoke) |
+| `key-store/mongo-key-store.ts` | MongoDB implementation (queries ApiKey collection) |
+| `key-store/json-file-key-store.ts` | JSON file implementation (legacy, backward compat) |
+| `key-store/create-key-store.ts` | Factory: selects Mongo or JSON based on TUNELO_KEY_STORE env |
+
+#### Rate Limiting (Pluggable)
+| Module | Purpose |
+|--------|---------|
+| `rate-limit/rate-limit-store.ts` | RateLimitStore interface |
+| `rate-limit/memory-rate-limit-store.ts` | In-memory store (suitable for single-server MVP) |
+
+#### Utilities
+| Module | Purpose |
+|--------|---------|
+| `tunnel-auth-checker.ts` | Validates API key during WS auth (uses KeyStore) |
+| `scripts/migrate-keys.ts` | CLI tool: migrate keys from env → MongoDB |
+| `logger.ts` | Pino logger factory with request-level context |
 
 ### Existing Modules (v0.1 Unchanged)
 
@@ -267,46 +322,73 @@ File: `tests/e2e/`
 - `auth-flow.test.ts` (5 tests) — Auth success/failure, invalid keys
 - `tunnel-flow.test.ts` (5 tests) — Request/response relay, timeouts
 
-## Dashboard Package (`packages/dashboard`) — v0.3 Planned
+## Dashboard Package (`packages/dashboard`) — v0.3 Planned/Built
 
-**Purpose:** React + Vite admin dashboard for user/tunnel/usage management.
-
-### Key Pages
-- **Users:** Table of all users, email, role, status, last login, actions (suspend/activate)
-- **Tunnels:** Active tunnels per user, subdomain, connected time, request rate
-- **Stats:** Usage charts (daily requests, bandwidth), peak times, error rates
-- **Keys:** All API keys across users, usage per key, expiry management
+**Purpose:** React + Vite admin dashboard for user/tunnel/usage management (served at `/dashboard/*`).
 
 ### Tech Stack
 - React 18 + Vite + TypeScript
 - Recharts for metrics visualization
 - React Router for navigation
 - Tailwind CSS for styling
-- API integration with `/api/admin/*` endpoints
+- Axios/fetch wrapper for `/api/admin/*` endpoints
 
-## Client Package (`packages/client`) — v0.3 Enhancements
+### Key Pages (Planned)
+- **Users:** Table of all users (email, role, status, created date), actions (view details, suspend/activate)
+- **Tunnels:** Active tunnels per user (subdomain, connected time, request rate, bandwidth)
+- **Stats:** Usage charts (daily requests, bandwidth), peak times, error rates
+- **Keys:** All API keys across users (label, owner, usage, expiry), revoke actions
 
-### Existing (v0.1)
-- CLI tool for creating tunnels
-- `tunnel-client.ts`, `local-proxy.ts`, `display.ts`
+**Access:** Protected by admin role (ADMIN_EMAILS env var)
 
-### New (v0.3)
-**Client Portal SPA** — Embedded React app served at `localhost:4040`
+## Client Package (`packages/client`) — v0.3 Complete
+
+### CLI (HTTP Tunnel)
+| Module | Purpose |
+|--------|---------|
+| `cli.ts` | Commander.js CLI: parse args (http, tcp, config, auth commands) |
+| `cli-device-auth.ts` | Device code auth: login/register/logout commands with browser flow |
+| `tunnel-client.ts` | WebSocket client: connect, auth, message relay, auto-reconnect |
+| `local-proxy.ts` | HTTP proxy to localhost:PORT, serialize req/resp |
+| `display.ts` | Terminal UI (chalk): status bar, request log, colors |
+| `portal-server.ts` | Embedded Node.js server for Portal SPA at :4041 |
+
+### CLI (TCP Tunnel)
+| Module | Purpose |
+|--------|---------|
+| `cli-tcp-command.ts` | TCP tunnel mode implementation |
+| `tcp-proxy.ts` | TCP proxy to localhost:PORT |
+| `tcp-ws-handler.ts` | TCP ↔ WS message framing (binary compatibility) |
+| `tcp-port-manager.ts` | Manage allocated ports for multiple tunnels |
+
+### Portal SPA (v0.3+ — Complete)
+**Embedded React app served by client at `http://localhost:4041`**
 
 | Module | Purpose |
 |--------|---------|
-| `portal/app.tsx` | React SPA entry point |
-| `portal/pages/signup.tsx` | Email/password registration + TOTP setup |
-| `portal/pages/login.tsx` | Email/password + TOTP verification |
-| `portal/pages/keys.tsx` | List user's API keys, create/revoke, copy to clipboard |
-| `portal/pages/usage.tsx` | Daily usage chart, requests/bandwidth per key |
-| `portal/components/totp-setup.tsx` | QR code display, backup codes |
-| `portal/api-client.ts` | Fetch wrapper for /api/* endpoints |
+| `portal/app.tsx` | React SPA: routing, auth context, session management |
+| `portal/pages/signup-page.tsx` | Email/password registration + TOTP setup |
+| `portal/pages/login-page.tsx` | Email/password login + TOTP verification |
+| `portal/pages/device-auth-page.tsx` | Device code confirmation (visual code match + approve button) |
+| `portal/pages/keys-page.tsx` | List user's API keys, create (with label/expiry), revoke, copy |
+| `portal/pages/usage-page.tsx` | Daily usage chart (requests/bandwidth per key, Recharts) |
+| `portal/pages/profile-page.tsx` | View user profile, change password |
+| `portal/components/totp-setup.tsx` | QR code display (qrcode.react), manual secret entry |
+| `portal/components/key-create-modal.tsx` | Modal: create key with label and optional expiry |
+| `portal/components/key-list.tsx` | Key table with copy/revoke actions |
+| `portal/components/usage-chart.tsx` | Recharts line/bar charts for usage metrics |
+| `portal/components/nav-bar.tsx` | Header with user email, logout button |
+| `portal/hooks/use-auth.ts` | Auth context: login, signup, TOTP verify, token refresh |
+| `portal/hooks/use-api.ts` | Fetch wrapper: auto-refresh token on 401, error handling |
+| `portal/api/client.ts` | Typed API client for /api/* endpoints |
 
 **How it works:**
-1. `npx tunelo http 3000` starts client
-2. Client prints: `Portal: http://localhost:4040`
-3. User visits in browser → signup → TOTP setup → get API key → back to CLI
+1. User runs: `npx tunelo http 3000`
+2. CLI starts portal server at `http://localhost:4041`
+3. CLI prints: `Portal: http://localhost:4041` and opens in browser
+4. User signs up → email → password → TOTP (scan QR) → generates API key
+5. User copies key → returns to CLI → enters key → tunnel connects
+6. Subsequent use: email → password → TOTP → manage keys/view usage
 
 ## Infrastructure (`infra/`)
 
@@ -419,29 +501,39 @@ Client auto-reconnect with configurable max attempts. Prevents connection storms
 - **Rate Limiting:** 100 msg/sec per connection
 - **Timeouts:** 30s request relay, 30s WS ping
 
-## v0.3 Roadmap (In Progress)
+## Feature Progression
 
-**Completed (v0.1):**
+**v0.1 (Complete — 2026-03-28):**
 ✓ WebSocket relay + HTTP tunneling
-✓ API key auth (SHA-256 hashed, env-based)
+✓ API key auth (SHA-256 hashed, env-based, from env var)
 ✓ Client CLI + chalk display
-✓ 19 unit + E2E tests
+✓ 19 unit + E2E tests passing
 
-**In Progress (v0.3):**
-⏳ MongoDB models (User, ApiKey, UsageLog)
-⏳ Express API (auth, keys, usage endpoints)
-⏳ TOTP 2FA setup + verification
-⏳ Admin Dashboard SPA
-⏳ Client Portal SPA
-⏳ JWT token management (access + refresh)
-⏳ Rate limiter interface design
-⏳ Usage tracking + daily snapshots
+**v0.3 (Complete — 2026-03-29):**
+✓ MongoDB models (User, ApiKey, UsageLog)
+✓ Express API (auth, keys, usage, admin endpoints)
+✓ TOTP 2FA setup + verification (otplib, qrcode)
+✓ Client Portal SPA (signup, login, key management, usage charts)
+✓ JWT token management (24h access, 7d refresh, httpOnly cookies)
+✓ Rate limiter interface + memory implementation
+✓ Usage tracking + daily snapshot aggregation
+✓ Admin Dashboard SPA (served at /dashboard/*)
+✓ CSRF protection (double-submit pattern)
+✓ Zod validation for all request bodies
+✓ Pluggable KeyStore (MongoDB + JSON file)
+✓ TCP tunneling support
 
-**Next (v0.4+):**
-- WebSocket pass-through (tunnel WS traffic)
+**v0.3.1 (Complete — 2026-03-29):**
+✓ Device Code Authorization Flow (browser-based, like gh auth)
+✓ Atomic device code operations (prevent race conditions)
+✓ 5-minute TTL with MongoDB TTL index
+✓ CLI commands: login, register, logout
+✓ Portal device approval page (visual code confirmation)
+
+**v0.4+ (Planned):**
+- WebSocket pass-through (tunnel WS traffic, not just HTTP)
 - Binary streaming (replace base64 with binary frames)
 - Standalone binary distribution (pkg/nexe)
 - Request inspection/replay
 - Custom domain support
-- Raw TCP tunneling
-- Multi-server scaling (Redis + load balancer, planned v0.5)
+- Multi-server scaling (Redis + load balancer)

@@ -1,9 +1,12 @@
 import type { RegisterTunnelResult } from "@tunelo/shared";
 import { program } from "commander";
+import { registerDeviceAuthCommands } from "./cli-device-auth.js";
+import { registerKeysCommands } from "./cli-keys-commands.js";
 import { registerTcpCommand } from "./cli-tcp-command.js";
 import { getConfigPath, loadConfig, saveConfig } from "./config.js";
 import { Display } from "./display.js";
 import { createInspectorIntegration } from "./inspector-integration.js";
+import { startPortalServer, stopPortalServer } from "./portal-server.js";
 import type { InspectorEntry } from "./request-store.js";
 import { TunnelClient } from "./tunnel-client.js";
 import { parseTunnelArgs } from "./tunnel-config-parser.js";
@@ -27,6 +30,8 @@ program
 	.option("-a, --auth <user:pass>", "Protect tunnel(s) with Basic Auth")
 	.option("--inspect-port <port>", "Inspector UI port (default: 4040)", "4040")
 	.option("--no-inspect", "Disable request inspector")
+	.option("--portal-port <port>", "Portal server port (default: 4041)", "4041")
+	.option("--no-portal", "Disable the portal server")
 	.option("-q, --quiet", "Suppress request logging")
 	.option("-v, --verbose", "Show extra details (body size)")
 	.action(
@@ -39,6 +44,8 @@ program
 				server?: string;
 				inspectPort?: string;
 				inspect?: boolean;
+				portalPort?: string;
+				portal?: boolean;
 				quiet?: boolean;
 				verbose?: boolean;
 			},
@@ -95,6 +102,9 @@ program
 				additionalTunnels: additional,
 			});
 
+			const portalPort = Number(options.portalPort) || 4041;
+			const portalEnabled = options.portal !== false;
+
 			client.on("connected", (result: { url: string; subdomain: string }) => {
 				subdomainPortMap.set(result.subdomain, primary.port);
 				display.showConnected(
@@ -106,6 +116,17 @@ program
 				if (inspector) {
 					inspector.start();
 					display.showInspector(inspectPort);
+				}
+				if (portalEnabled) {
+					startPortalServer(portalPort)
+						.then(() => {
+							display.showPortal(portalPort);
+						})
+						.catch((err: Error) => {
+							display.showError(
+								`Portal server failed to start: ${err.message}`,
+							);
+						});
 				}
 			});
 
@@ -162,6 +183,7 @@ program
 
 			process.on("SIGINT", () => {
 				client.disconnect();
+				if (portalEnabled) void stopPortalServer();
 				display.showStats();
 				process.exit(0);
 			});
@@ -169,6 +191,8 @@ program
 	);
 
 registerTcpCommand(program, display);
+registerDeviceAuthCommands(program);
+registerKeysCommands(program);
 
 program
 	.command("config")

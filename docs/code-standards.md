@@ -64,6 +64,7 @@ Format: `TUNELO_{DOMAIN}_{NUMBER}`
 | Domain | Prefix | Range | Examples |
 |--------|--------|-------|----------|
 | Authentication | `TUNELO_AUTH_` | 001-099 | 001=Invalid key, 002=Key required, 003=TOTP required, 004=TOTP invalid |
+| Device Auth | `TUNELO_DEVICE_` | 001-099 | 001=Invalid/expired code, 002=Code expired, 003=Already approved, 004=Too many attempts |
 | API Keys | `TUNELO_KEY_` | 001-099 | 001=Key not found, 002=Key revoked, 003=Key expired |
 | User management | `TUNELO_USER_` | 001-099 | 001=User not found, 002=Email already exists |
 | Tunnel management | `TUNELO_TUNNEL_` | 001-099 | 001=Subdomain in use, 002=Not found, 003=Connection lost |
@@ -173,10 +174,22 @@ export function requireRole(allowedRoles: string[]) {
   };
 }
 
-// Apply to routes
+// Apply to routes (v0.3)
 router.get('/api/admin/users', requireRole(['admin']), async (req, res) => {
   // Only admins can access
 });
+```
+
+### Admin Guard Middleware (v0.3)
+
+```typescript
+// api/middleware/admin-guard.ts
+export function adminGuard(req: Request, res: Response, next: NextFunction) {
+  if (req.user?.role !== 'admin') {
+    throw new TuneloError('TUNELO_ADMIN_001', 'Admin access required', 403);
+  }
+  next();
+}
 ```
 
 ### JWT Token Validation
@@ -206,23 +219,54 @@ const refreshToken = jwt.sign(
 );
 ```
 
-### Secure Cookie Headers
+### Secure Cookie Headers (v0.3)
 
 ```typescript
-// httpOnly + secure + SameSite
-res.cookie('accessToken', token, {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'strict',
-  maxAge: 24 * 60 * 60 * 1000 // 24h
-});
+// api/middleware/cookie-auth.ts
+import jwt from 'jsonwebtoken';
 
-res.cookie('refreshToken', refreshToken, {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'strict',
-  maxAge: 7 * 24 * 60 * 60 * 1000 // 7d
-});
+// httpOnly + secure + SameSite + __Host- prefix (production)
+export function setTokenCookies(res: Response, accessToken: string, refreshToken: string) {
+  const secure = process.env.NODE_ENV === 'production';
+  const cookiePrefix = secure ? '__Host-' : '';
+
+  res.cookie(`${cookiePrefix}accessToken`, accessToken, {
+    httpOnly: true,
+    secure,
+    sameSite: 'strict',
+    maxAge: 24 * 60 * 60 * 1000, // 24h
+    path: '/'
+  });
+
+  res.cookie(`${cookiePrefix}refreshToken`, refreshToken, {
+    httpOnly: true,
+    secure,
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7d
+    path: '/'
+  });
+}
+
+// Extract from cookies
+export function extractTokensFromCookies(req: Request): { accessToken?: string; refreshToken?: string } {
+  const cookiePrefix = process.env.NODE_ENV === 'production' ? '__Host-' : '';
+  return {
+    accessToken: req.cookies[`${cookiePrefix}accessToken`],
+    refreshToken: req.cookies[`${cookiePrefix}refreshToken`]
+  };
+}
+```
+
+### JWT Payload Structure (v0.3)
+
+```typescript
+interface JwtPayload {
+  userId: string;        // MongoDB ObjectId as string
+  email: string;
+  role: 'user' | 'admin';
+  iat: number;           // Issued at
+  exp: number;           // Expiration
+}
 ```
 
 ## Testing
@@ -278,11 +322,70 @@ pnpm lint        # check only
 pnpm lint:fix    # auto-fix
 ```
 
+## Input Validation (v0.3)
+
+### Zod Schemas (API Endpoints)
+
+All API request bodies must use Zod schemas (v0.3+):
+
+```typescript
+// api/schemas/auth-schemas.ts
+import { z } from 'zod';
+
+export const SignupSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(8, 'Password must be 8+ characters')
+});
+
+export const LoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string(),
+  totpCode: z.string().optional()
+});
+
+export const VerifyTotpSchema = z.object({
+  code: z.string().regex(/^\d{6}$/, 'TOTP must be 6 digits')
+});
+
+// In route handler (middleware validates before reaching handler)
+router.post('/signup', validateBody(SignupSchema), async (req, res) => {
+  // req.body is type-safe: { email: string; password: string }
+});
+```
+
+### Validation Middleware (v0.3)
+
+```typescript
+// api/middleware/validate-body.ts
+import { z } from 'zod';
+
+export function validateBody(schema: z.ZodSchema) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const validated = schema.parse(req.body);
+      req.body = validated;
+      next();
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          error: {
+            code: 'TUNELO_VALIDATION_001',
+            message: 'Invalid request body',
+            details: err.errors
+          }
+        });
+      }
+      next(err);
+    }
+  };
+}
+```
+
 ## Security
 
-### Input Validation
+### Input Validation (WebSocket Messages)
 
-All external input must be validated at system boundaries:
+WebSocket messages use discriminated unions + type guards (v0.1):
 
 ```typescript
 // Subdomain validation
@@ -327,34 +430,118 @@ X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
 | Subdomain length | 1-63 chars | RFC 1123 |
 | Max tunnels per key | 10 | Prevent abuse (MVP) |
 
+### CSRF Protection (v0.3)
+
+Double-submit token pattern:
+
+```typescript
+// api/middleware/csrf-protection.ts
+import crypto from 'crypto';
+
+// Generate CSRF token
+export function generateCsrfToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// Verify middleware
+export function verifyCsrfToken(req: Request, res: Response, next: NextFunction) {
+  const token = req.headers['x-csrf-token'] as string;
+  const sessionToken = req.cookies['csrf-token'];
+
+  if (!token || !sessionToken || token !== sessionToken) {
+    throw new TuneloError('TUNELO_CSRF_001', 'Invalid CSRF token', 403);
+  }
+  next();
+}
+
+// In auth response (after login):
+res.cookie('csrf-token', generateCsrfToken(), {
+  httpOnly: false,  // Allow JavaScript access
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict'
+});
+```
+
+### Rate Limiting (v0.3)
+
+Per-IP rate limiting for API endpoints:
+
+```typescript
+// api/middleware/rate-limiter.ts
+export function createRateLimiter(store: RateLimitStore) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const ip = req.ip!;
+    const key = `${ip}:${req.path}`;
+    const limit = 100; // requests per minute
+
+    const count = await store.increment(key, 60);
+    if (count > limit) {
+      throw new TuneloError('TUNELO_RATE_LIMIT_001', 'Rate limit exceeded', 429);
+    }
+    next();
+  };
+}
+```
+
 ### API Key Storage (v0.3)
 
-**Database-backed (MongoDB):**
+**MongoDB-backed (default):**
 - Store only SHA-256 hashes in `ApiKey.keyHash`
 - Expose first 8 chars as `keyPrefix` for user reference
 - Never log full keys or hashes
-- Keys linked to User via `userId`
-- Revoke by setting `status: 'revoked'`
+- Keys linked to User via `userId` (MongoDB ObjectId)
+- Revoke by setting `status: 'revoked'` (soft delete)
+- Optional expiry date tracked in `expiresAt`
 
-**Generation:**
+**Generation (services/key-service.ts):**
 ```typescript
 import crypto from 'crypto';
+import { nanoid } from 'nanoid';
 
-// Generate new key
-const plainKey = `tk_${nanoid(32)}`;
-const keyHash = crypto.createHash('sha256').update(plainKey).digest('hex');
-const keyPrefix = plainKey.slice(0, 8);
+export function generateApiKey(): { plainKey: string; keyHash: string; keyPrefix: string } {
+  const plainKey = `tk_${nanoid(32)}`;
+  const keyHash = crypto.createHash('sha256').update(plainKey).digest('hex');
+  const keyPrefix = plainKey.slice(0, 8);  // e.g., "tk_abcd"
 
-// Return to user once (never stored or sent again)
-return { plainKey, keyPrefix, hash: keyHash };
+  return { plainKey, keyHash, keyPrefix };
+}
 ```
 
-**Validation during tunnel auth:**
+**Validation (tunnel-auth-checker.ts):**
 ```typescript
 // Client sends plainKey, server hashes and compares
 const incomingHash = crypto.createHash('sha256').update(incomingKey).digest('hex');
-const storedKey = await ApiKey.findOne({ keyHash: incomingHash }).lean();
-if (!storedKey || storedKey.status === 'revoked') {
+const storedKey = await keyStore.validateKey(incomingHash);  // Uses KeyStore interface
+
+if (!storedKey) {
   throw new TuneloError('TUNELO_AUTH_001', 'Invalid API key', 401);
 }
+```
+
+**Mongoose Model:**
+```typescript
+// db/models/api-key-model.ts
+interface IApiKey {
+  userId: mongoose.Types.ObjectId;
+  keyHash: string;         // SHA-256 hash
+  keyPrefix: string;       // First 8 chars (tk_xxxx)
+  label: string;           // User-friendly name
+  status: 'active' | 'revoked';
+  expiresAt?: Date;
+  lastUsedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const apiKeySchema = new Schema<IApiKey>({
+  userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  keyHash: { type: String, required: true, unique: true, index: true },
+  keyPrefix: { type: String, required: true },
+  label: { type: String, required: true },
+  status: { type: String, enum: ['active', 'revoked'], default: 'active' },
+  expiresAt: Date,
+  lastUsedAt: Date,
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
 ```
