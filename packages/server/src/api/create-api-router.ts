@@ -13,10 +13,21 @@ import { createUsageRouter } from "./usage-routes.js";
 export function createApiRouter(): Router {
 	const router = Router();
 
-	// CORS: allow client portal + dashboard
+	// CORS: allow client portal + dashboard (dev + production)
+	// Override via CORS_ORIGINS env (comma-separated) for additional origins
+	const defaultOrigins = [
+		"http://localhost:4040",
+		"http://127.0.0.1:4040",
+		"http://localhost:5173",
+		"http://127.0.0.1:5173",
+	];
+	const extraOrigins = (process.env.CORS_ORIGINS ?? "")
+		.split(",")
+		.map((o) => o.trim())
+		.filter(Boolean);
 	router.use(
 		cors({
-			origin: ["http://localhost:4040", "http://127.0.0.1:4040"],
+			origin: [...defaultOrigins, ...extraOrigins],
 			credentials: true,
 		}),
 	);

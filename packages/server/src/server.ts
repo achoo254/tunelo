@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,10 +29,14 @@ async function start(): Promise<void> {
 	app.use("/api", apiRouter);
 
 	// Serve dashboard SPA static files at /dashboard/*
-	const dashboardDist = path.resolve(
-		fileURLToPath(import.meta.url),
-		"../../../dashboard/dist",
-	);
+	// Resolution order: DASHBOARD_DIST env > monorepo dev path > sibling dir of bundled server (production)
+	const serverFileDir = path.dirname(fileURLToPath(import.meta.url));
+	const dashboardDist =
+		process.env.DASHBOARD_DIST ??
+		(fs.existsSync(path.resolve(serverFileDir, "../../dashboard/dist"))
+			? path.resolve(serverFileDir, "../../dashboard/dist")
+			: path.resolve(serverFileDir, "dashboard"));
+	logger.info({ dashboardDist }, "Serving dashboard from");
 	app.use("/dashboard", express.static(dashboardDist));
 	app.get("/dashboard/{*path}", (_req, res) => {
 		res.sendFile(path.join(dashboardDist, "index.html"));

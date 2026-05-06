@@ -1,6 +1,6 @@
 {
 	"name": "@achoo254/tunelo",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"type": "module",
 	"description": "Self-hosted ngrok alternative — expose local services via public HTTPS tunnels",
 	"main": "dist/cli.js",
