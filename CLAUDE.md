@@ -96,3 +96,13 @@ Browser → nginx (443, TLS, wildcard cert)
        → Client CLI
        → localhost:PORT
 ```
+
+## Đồng bộ context & ghi lý do thay đổi
+
+Vì code clone/chạy trên nhiều máy, "lý do thay đổi" phải đi theo `git pull` — KHÔNG để trong session/memory cục bộ của Claude. Quy ước:
+
+- **Commit message phải có "why"** trong body (conventional commit), không chỉ "what".
+- **Quyết định kiến trúc / đánh đổi lâu dài** → ghi ADR vào `docs/decisions/` (copy `0000-adr-template.md`).
+- **Kế hoạch feature/fix** → `plans/<user>/` (scope theo người, tránh xung đột merge — xem `plans/README.md`).
+- **Đặt tên file/ADR theo nội dung**, không theo số phase / mã plan (plan đổi tên thì reference thành rác).
+- **Secret**: mọi `.env.*` đã gitignore — KHÔNG commit. Lỡ lộ lên git → **rotate ngay** (`git rm --cached` không đủ vì secret vẫn trong history).
