@@ -20,8 +20,10 @@ await build({
 	},
 	// Externalize node builtins and heavy deps that users install
 	external: ["chalk", "commander", "pino", "ws"],
+	// Shebang comes from the entry file (src/cli.ts); esbuild preserves it at the
+	// top of the bundle. Keep only a marker comment here to avoid a duplicate shebang.
 	banner: {
-		js: "#!/usr/bin/env node\n// Tunelo CLI — bundled with esbuild",
+		js: "// Tunelo CLI — bundled with esbuild",
 	},
 });
 

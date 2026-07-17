@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import type { RegisterTunnelResult } from "@tunelo/shared";
 import { program } from "commander";
 import { registerDeviceAuthCommands } from "./cli-device-auth.js";
